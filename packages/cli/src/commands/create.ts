@@ -19,9 +19,9 @@
 
 import { writeFile } from 'node:fs/promises';
 import { IfcCreator } from '@ifc-lite/create';
-import { getFlag, hasFlag, fatal, printJson } from '../output.js';
+import { getFlag, hasFlag, fatal, printJson, validateViewerPort } from '../output.js';
 
-const ELEMENT_TYPES = [
+export const ELEMENT_TYPES = [
   'wall', 'slab', 'column', 'beam', 'stair', 'roof', 'gable-roof',
   'door', 'window', 'wall-door', 'wall-window', 'ramp', 'railing',
   'plate', 'member', 'footing', 'pile', 'space', 'curtain-wall',
@@ -37,7 +37,7 @@ export async function createCommand(args: string[]): Promise<void> {
   }
 
   const outPath = getFlag(args, '--out');
-  if (!outPath) fatal('--out is required for create command');
+  const viewerPort = validateViewerPort(getFlag(args, '--viewer'));
 
   const projectName = getFlag(args, '--project') ?? 'CLI Project';
   const storeyName = getFlag(args, '--storey') ?? 'Ground Floor';
@@ -90,21 +90,63 @@ export async function createCommand(args: string[]): Promise<void> {
   }
 
   const result = creator.toIfc();
-  await writeFile(outPath, result.content, 'utf-8');
+
+  // Write to file (if --out specified)
+  if (outPath) {
+    await writeFile(outPath, result.content, 'utf-8');
+  }
+
+  // Stream to viewer (if --viewer specified)
+  let viewerOk = false;
+  if (viewerPort) {
+    try {
+      const resp = await fetch(`http://localhost:${viewerPort}/api/command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'addGeometry',
+          ifcContent: result.content,
+        }),
+      });
+      if (!resp.ok) {
+        process.stderr.write(`Viewer HTTP ${resp.status}: ${resp.statusText}\n`);
+      } else {
+        const status = (await resp.json()) as { ok: boolean; error?: string };
+        if (status.ok) {
+          viewerOk = true;
+          process.stderr.write(`Streamed to viewer on port ${viewerPort}\n`);
+        } else {
+          process.stderr.write(`Viewer error: ${status.error}\n`);
+        }
+      }
+    } catch {
+      process.stderr.write(`Could not connect to viewer on port ${viewerPort}\n`);
+    }
+  }
+
+  if (!outPath && !viewerPort) {
+    fatal('--out or --viewer is required for create command');
+  }
+
+  // Fail if viewer-only mode and streaming failed
+  if (viewerPort && !outPath && !viewerOk) {
+    fatal('Failed to stream geometry to viewer (no --out fallback)');
+  }
 
   if (jsonOutput) {
     printJson({
-      file: outPath,
+      file: outPath ?? null,
       entityCount: result.stats.entityCount,
       fileSize: result.stats.fileSize,
       entities: result.entities,
+      streamedToViewer: viewerOk,
     });
-  } else {
+  } else if (outPath) {
     process.stderr.write(`IFC written to ${outPath} (${result.stats.entityCount} entities)\n`);
   }
 }
 
-function addElement(creator: IfcCreator, storey: number, elementType: string, params: Record<string, unknown>): number {
+export function addElement(creator: IfcCreator, storey: number, elementType: string, params: Record<string, unknown>): number {
   const p = params;
   switch (elementType.toLowerCase()) {
     case 'wall':
