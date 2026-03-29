@@ -30,12 +30,24 @@ interface GLTFMesh {
     name?: string;
 }
 
+interface GLTFMaterial {
+    pbrMetallicRoughness: {
+        baseColorFactor: [number, number, number, number];
+        metallicFactor: number;
+        roughnessFactor: number;
+    };
+    extensions?: Record<string, Record<string, never>>;
+    name?: string;
+    alphaMode?: 'OPAQUE' | 'MASK' | 'BLEND';
+}
+
 interface GLTFPrimitive {
     attributes: {
         POSITION: number;
         NORMAL?: number;
     };
     indices?: number;
+    material?: number;
     mode?: number;
 }
 
@@ -68,9 +80,11 @@ interface GLTFDocument {
     scenes: GLTFScene[];
     nodes: GLTFNode[];
     meshes: GLTFMesh[];
+    materials?: GLTFMaterial[];
     accessors: GLTFAccessor[];
     bufferViews: GLTFBufferView[];
     buffers: GLTFBuffer[];
+    extensionsUsed?: string[];
 }
 
 export interface GLTFExportOptions {
@@ -129,115 +143,147 @@ export class GLTFExporter {
             };
         }
 
-        // Collect geometry data
-        const positions: number[] = [];
-        const normals: number[] = [];
-        const indices: number[] = [];
+        // Build materials from mesh colors (deduplicate by rounded RGBA key)
+        const materialMap = new Map<string, number>();
+        const materials: GLTFMaterial[] = [];
 
-        const nodeIndices: number[] = [];
+        function getOrCreateMaterial(color: [number, number, number, number]): number {
+            // Round to 2 decimals for deduplicate key only — use original values for export
+            const key = `${Math.round(color[0] * 100)},${Math.round(color[1] * 100)},${Math.round(color[2] * 100)},${Math.round(color[3] * 100)}`;
+            const existing = materialMap.get(key);
+            if (existing !== undefined) return existing;
+            const idx = materials.length;
+            materials.push({
+                pbrMetallicRoughness: {
+                    baseColorFactor: [color[0], color[1], color[2], color[3]],
+                    metallicFactor: 0,
+                    roughnessFactor: 1,
+                },
+                extensions: { KHR_materials_unlit: {} },
+                ...(color[3] < 1 ? { alphaMode: 'BLEND' as const } : {}),
+            });
+            materialMap.set(key, idx);
+            return idx;
+        }
 
-        // Helper function to calculate min/max bounds for positions
-        const calculateBounds = (positions: number[]): { min: number[]; max: number[] } => {
-            if (positions.length === 0) {
-                return { min: [0, 0, 0], max: [0, 0, 0] };
-            }
-            let minX = positions[0];
-            let minY = positions[1];
-            let minZ = positions[2];
-            let maxX = positions[0];
-            let maxY = positions[1];
-            let maxZ = positions[2];
+        // ── Pass 1: collect metadata and calculate total sizes ──────────
+        // We avoid intermediate JS arrays (positions: number[]) because
+        // Array.push(...typedArray) hits the JS engine argument limit on
+        // large models (109K meshes, 16M+ vertices).
 
-            for (let i = 0; i < positions.length; i += 3) {
-                const x = positions[i];
-                const y = positions[i + 1];
-                const z = positions[i + 2];
-                minX = Math.min(minX, x);
-                minY = Math.min(minY, y);
-                minZ = Math.min(minZ, z);
-                maxX = Math.max(maxX, x);
-                maxY = Math.max(maxY, y);
-                maxZ = Math.max(maxZ, z);
-            }
-
-            return {
-                min: [minX, minY, minZ],
-                max: [maxX, maxY, maxZ],
-            };
+        type MeshMeta = {
+            meshIndex: number;
+            posCount: number;   // float count
+            normCount: number;
+            idxCount: number;
+            posByteOffset: number;
+            normByteOffset: number;
+            idxByteOffset: number;
+            bounds: { min: number[]; max: number[] };
+            materialIdx: number | undefined;
         };
+
+        const meshMetas: MeshMeta[] = [];
+        let totalPosFloats = 0;
+        let totalNormFloats = 0;
+        let totalIdxInts = 0;
 
         for (let i = 0; i < meshes.length; i++) {
             const mesh = meshes[i];
-            const meshPositions = mesh.positions;
-            const meshNormals = mesh.normals;
-            const meshIndices = mesh.indices;
+            const mp = mesh.positions;
+            const mn = mesh.normals;
+            const mi = mesh.indices;
 
-            // Skip empty meshes
-            if (!meshPositions.length || !meshNormals.length || !meshIndices.length) {
-                console.warn(`Skipping empty mesh ${i} (positions: ${meshPositions.length}, normals: ${meshNormals.length}, indices: ${meshIndices.length})`);
-                continue;
+            if (!mp.length || !mn.length || !mi.length) continue;
+            if (mp.length % 3 !== 0 || mn.length % 3 !== 0) continue;
+            if (mp.length !== mn.length) continue;
+
+            // Calculate bounds directly from the typed array
+            let minX = mp[0], minY = mp[1], minZ = mp[2];
+            let maxX = mp[0], maxY = mp[1], maxZ = mp[2];
+            for (let j = 3; j < mp.length; j += 3) {
+                const x = mp[j], y = mp[j + 1], z = mp[j + 2];
+                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                if (y < minY) minY = y; if (y > maxY) maxY = y;
+                if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
             }
 
-            // Validate array lengths are multiples of 3 for positions/normals
-            if (meshPositions.length % 3 !== 0) {
-                console.warn(`Mesh ${i} has invalid position count: ${meshPositions.length} (not divisible by 3)`);
-                continue;
-            }
-            if (meshNormals.length % 3 !== 0) {
-                console.warn(`Mesh ${i} has invalid normal count: ${meshNormals.length} (not divisible by 3)`);
-                continue;
-            }
+            meshMetas.push({
+                meshIndex: i,
+                posCount: mp.length,
+                normCount: mn.length,
+                idxCount: mi.length,
+                posByteOffset: totalPosFloats * 4,
+                normByteOffset: totalNormFloats * 4,
+                idxByteOffset: totalIdxInts * 4,
+                bounds: { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] },
+                materialIdx: mesh.color ? getOrCreateMaterial(mesh.color) : undefined,
+            });
 
-            // Calculate byte offsets BEFORE adding data (based on current array lengths)
-            const positionByteOffset = positions.length * 4; // Each float is 4 bytes
-            const normalByteOffset = normals.length * 4;
-            const indexByteOffset = indices.length * 4;
+            totalPosFloats += mp.length;
+            totalNormFloats += mn.length;
+            totalIdxInts += mi.length;
+        }
 
-            const meshPositionsArray = Array.from(meshPositions);
-            const meshNormalsArray = Array.from(meshNormals);
-            const meshIndicesArray = Array.from(meshIndices);
+        if (totalPosFloats === 0 || totalNormFloats === 0 || totalIdxInts === 0) {
+            throw new Error('Cannot export GLB: no valid geometry data found');
+        }
 
-            positions.push(...meshPositionsArray);
-            normals.push(...meshNormalsArray);
+        // ── Pass 2: build glTF structure and copy geometry into typed arrays ──
 
-            // Indices stay local (0-based) for each mesh since each mesh has its own
-            // accessor pointing to its own section of the bufferView
-            indices.push(...meshIndicesArray);
+        const positionsArray = new Float32Array(totalPosFloats);
+        const normalsArray = new Float32Array(totalNormFloats);
+        const indicesArray = new Uint32Array(totalIdxInts);
 
-            // Calculate bounds for this mesh's positions
-            const bounds = calculateBounds(meshPositionsArray);
+        let posOffset = 0;
+        let normOffset = 0;
+        let idxOffset = 0;
 
-            // Accessors - byteOffset is relative to the bufferView start
+        const nodeIndices: number[] = [];
+
+        for (const meta of meshMetas) {
+            const mesh = meshes[meta.meshIndex];
+
+            // Copy geometry data directly (no intermediate array)
+            positionsArray.set(mesh.positions, posOffset);
+            normalsArray.set(mesh.normals, normOffset);
+            indicesArray.set(mesh.indices, idxOffset);
+
+            posOffset += meta.posCount;
+            normOffset += meta.normCount;
+            idxOffset += meta.idxCount;
+
+            // Accessors
             const posAccessorIdx = gltf.accessors.length;
             gltf.accessors.push({
                 bufferView: 0,
-                byteOffset: positionByteOffset,
-                componentType: 5126, // FLOAT
-                count: meshPositions.length / 3,
+                byteOffset: meta.posByteOffset,
+                componentType: 5126,
+                count: meta.posCount / 3,
                 type: 'VEC3',
-                min: bounds.min,
-                max: bounds.max,
+                min: meta.bounds.min,
+                max: meta.bounds.max,
             });
 
             const normAccessorIdx = gltf.accessors.length;
             gltf.accessors.push({
                 bufferView: 1,
-                byteOffset: normalByteOffset,
+                byteOffset: meta.normByteOffset,
                 componentType: 5126,
-                count: meshNormals.length / 3,
+                count: meta.normCount / 3,
                 type: 'VEC3',
             });
 
             const idxAccessorIdx = gltf.accessors.length;
             gltf.accessors.push({
                 bufferView: 2,
-                byteOffset: indexByteOffset,
-                componentType: 5125, // UNSIGNED_INT
-                count: meshIndices.length,
+                byteOffset: meta.idxByteOffset,
+                componentType: 5125,
+                count: meta.idxCount,
                 type: 'SCALAR',
             });
 
-            // Mesh
+            // Mesh with material
             const meshIdx = gltf.meshes.length;
             gltf.meshes.push({
                 primitives: [{
@@ -246,37 +292,31 @@ export class GLTFExporter {
                         NORMAL: normAccessorIdx,
                     },
                     indices: idxAccessorIdx,
+                    ...(meta.materialIdx !== undefined ? { material: meta.materialIdx } : {}),
                 }],
             });
 
             // Node
             const nodeIdx = gltf.nodes.length;
-            const node: GLTFNode = {
-                mesh: meshIdx,
-            };
-
-            if (options.includeMetadata && mesh.expressId) {
-                node.extras = {
-                    expressId: mesh.expressId,
-                };
+            const node: GLTFNode = { mesh: meshIdx };
+            if (options.includeMetadata && mesh.expressId !== undefined) {
+                node.extras = mesh.modelIndex !== undefined
+                    ? { expressId: mesh.expressId, modelIndex: mesh.modelIndex }
+                    : { expressId: mesh.expressId };
             }
-
             gltf.nodes.push(node);
             nodeIndices.push(nodeIdx);
         }
 
         gltf.scenes[0].nodes = nodeIndices;
 
-        // Ensure we have data before creating buffers
-        if (positions.length === 0 || normals.length === 0 || indices.length === 0) {
-            throw new Error('Cannot export GLB: no valid geometry data found');
+        // Attach materials if any were created
+        if (materials.length > 0) {
+            gltf.materials = materials;
+            gltf.extensionsUsed = ['KHR_materials_unlit'];
         }
 
-        // Buffer views - create typed arrays and get their byte buffers
-        const positionsArray = new Float32Array(positions);
-        const normalsArray = new Float32Array(normals);
-        const indicesArray = new Uint32Array(indices);
-
+        // Buffer views
         const positionsBytes = positionsArray.buffer;
         const normalsBytes = normalsArray.buffer;
         const indicesBytes = indicesArray.buffer;

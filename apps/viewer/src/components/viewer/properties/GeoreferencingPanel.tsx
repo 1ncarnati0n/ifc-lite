@@ -13,7 +13,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { Badge } from '@/components/ui/badge';
 import { computeAngleToGridNorth, type GeoreferenceInfo, type MapConversion, type ProjectedCRS } from '@ifc-lite/parser';
 import { useViewerStore } from '@/store';
+import type { CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
 import { EpsgLookupDialog, type EpsgResult } from './EpsgLookupDialog';
+import { LocationMap } from './LocationMap';
 
 // ── Field-specific assistance data ─────────────────────────────────────
 
@@ -310,9 +312,13 @@ export interface GeoreferencingPanelProps {
   modelId?: string;
   enableEditing?: boolean;
   schemaVersion?: string;
+  /** CoordinateInfo from the model's geometry (for map position calculation) */
+  coordinateInfo?: CoordinateInfo;
+  /** GeometryResult for KMZ export */
+  geometryResult?: GeometryResult | null;
 }
 
-export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVersion }: GeoreferencingPanelProps) {
+export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVersion, coordinateInfo, geometryResult }: GeoreferencingPanelProps) {
   const georefMutations = useViewerStore(s => s.georefMutations);
   const setGeorefField = useViewerStore(s => s.setGeorefField);
   const setGeorefFields = useViewerStore(s => s.setGeorefFields);
@@ -577,6 +583,9 @@ export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVers
           </button>
         </div>
       )}
+
+      {/* Location minimap */}
+      <LocationMap mapConversion={mergedConversion} projectedCRS={mergedCRS} coordinateInfo={coordinateInfo} geometryResult={geometryResult} />
     </div>
   );
 }
