@@ -66,6 +66,12 @@ pub struct ProcessingStats {
     pub total_triangles: usize,
     /// Time spent parsing entities (ms).
     pub parse_time_ms: u64,
+    /// Time spent scanning entities and building initial job lists (ms).
+    pub entity_scan_time_ms: u64,
+    /// Time spent resolving lookups, styles, and optional metadata (ms).
+    pub lookup_time_ms: u64,
+    /// Time spent in geometry preprocessing before the extraction loop begins (ms).
+    pub preprocess_time_ms: u64,
     /// Time spent processing geometry (ms).
     pub geometry_time_ms: u64,
     /// Total processing time (ms).

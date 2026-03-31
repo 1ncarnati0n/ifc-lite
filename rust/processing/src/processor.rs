@@ -9,7 +9,7 @@
 use crate::types::mesh::MeshData;
 use crate::types::response::{CoordinateInfo, ModelMetadata, ProcessingStats};
 use ifc_lite_core::{
-    build_entity_index, AttributeValue, DecodedEntity, EntityDecoder,
+    build_entity_index, AttributeValue, DecodedEntity, EntityDecoder, EntityIndex,
     EntityScanner, IfcType,
 };
 use ifc_lite_geometry::{calculate_normals, GeometryRouter};
@@ -54,6 +54,33 @@ pub struct ProcessingResult {
     pub building_transform: Option<Vec<f64>>,
     pub metadata: ModelMetadata,
     pub stats: ProcessingStats,
+}
+
+/// Controls the tradeoff between first-frame latency and richer upfront metadata.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamingOptions {
+    /// Batch size used for the very first emitted chunk.
+    pub initial_batch_size: usize,
+    /// Batch size used after the first emitted chunk for higher throughput.
+    pub throughput_batch_size: usize,
+    /// Prioritize cheap/high-yield element classes first.
+    pub fast_first_batch: bool,
+    /// Include expensive property parsing on the first-frame path.
+    pub include_properties: bool,
+    /// Include expensive presentation-layer resolution on the first-frame path.
+    pub include_presentation_layers: bool,
+}
+
+impl Default for StreamingOptions {
+    fn default() -> Self {
+        Self {
+            initial_batch_size: 50,
+            throughput_batch_size: 50,
+            fast_first_batch: false,
+            include_properties: true,
+            include_presentation_layers: true,
+        }
+    }
 }
 
 const SITE_LOCAL_MESH_COORDINATE_SPACE: &str = "site_local";
@@ -113,6 +140,60 @@ struct EntityJob {
     name: Option<String>,
     presentation_layer: Option<String>,
     space_zone_properties: Option<BTreeMap<String, String>>,
+}
+
+fn populate_entity_job_metadata(
+    job: &mut EntityJob,
+    geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
+    layer_by_assigned_representation: &FxHashMap<u32, String>,
+    color_cache_by_product_definition_shape: &mut FxHashMap<u32, Option<[f32; 4]>>,
+    layer_cache_by_product_definition_shape: &mut FxHashMap<u32, Option<String>>,
+    layer_cache_by_representation: &mut FxHashMap<u32, Option<String>>,
+    decoder: &mut EntityDecoder,
+    include_presentation_layers: bool,
+) {
+    if job.global_id.is_some() || job.name.is_some() || job.product_definition_shape_id.is_some() {
+        return;
+    }
+
+    let Ok(entity) = decoder.decode_at(job.start, job.end) else {
+        return;
+    };
+
+    job.global_id = normalize_optional_string(entity.get_string(0));
+    job.name = normalize_optional_string(entity.get_string(2));
+    job.product_definition_shape_id = entity.get_ref(6);
+
+    let Some(product_definition_shape_id) = job.product_definition_shape_id else {
+        return;
+    };
+
+    let resolved_color = color_cache_by_product_definition_shape
+        .entry(product_definition_shape_id)
+        .or_insert_with(|| {
+            resolve_element_color_for_product_definition_shape(
+                product_definition_shape_id,
+                geometry_style_index,
+                decoder,
+            )
+        });
+    if let Some(color) = resolved_color {
+        job.element_color = *color;
+    }
+
+    if include_presentation_layers {
+        let resolved_layer = layer_cache_by_product_definition_shape
+            .entry(product_definition_shape_id)
+            .or_insert_with(|| {
+                resolve_presentation_layer_for_product_definition_shape(
+                    product_definition_shape_id,
+                    layer_by_assigned_representation,
+                    layer_cache_by_representation,
+                    decoder,
+                )
+            });
+        job.presentation_layer = resolved_layer.clone();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -374,15 +455,108 @@ fn assign_space_zone_properties(
     }
 }
 
+fn geometry_priority_score(ifc_type: &IfcType) -> u8 {
+    match ifc_type {
+        IfcType::IfcWall | IfcType::IfcWallStandardCase => 100,
+        IfcType::IfcSlab => 95,
+        IfcType::IfcColumn => 90,
+        IfcType::IfcBeam => 85,
+        IfcType::IfcRoof => 80,
+        IfcType::IfcStair | IfcType::IfcStairFlight => 75,
+        IfcType::IfcCurtainWall => 70,
+        IfcType::IfcFooting | IfcType::IfcPile => 65,
+        IfcType::IfcDoor | IfcType::IfcWindow => 30,
+        IfcType::IfcFurnishingElement => 10,
+        _ => 50,
+    }
+}
+
 /// Process IFC content with parallel geometry extraction (default opening filter).
 pub fn process_geometry(content: &str) -> ProcessingResult {
     process_geometry_filtered(content, OpeningFilterMode::Default)
 }
 
+/// Process IFC content with parallel geometry extraction and emit batches as they complete.
+pub fn process_geometry_streaming(
+    content: &str,
+    batch_size: usize,
+    on_batch: impl FnMut(&[MeshData], usize, usize),
+) -> ProcessingResult {
+    process_geometry_streaming_with_options(
+        content,
+        StreamingOptions {
+            initial_batch_size: batch_size,
+            throughput_batch_size: batch_size,
+            ..StreamingOptions::default()
+        },
+        on_batch,
+        |_| {},
+    )
+}
+
+/// Process IFC content with parallel geometry extraction and configurable streaming behavior.
+pub fn process_geometry_streaming_with_options(
+    content: &str,
+    options: StreamingOptions,
+    on_batch: impl FnMut(&[MeshData], usize, usize),
+    on_color_update: impl FnMut(&[(u32, [f32; 4])]),
+) -> ProcessingResult {
+    process_geometry_streaming_filtered_with_options(
+        content,
+        OpeningFilterMode::Default,
+        options,
+        on_batch,
+        on_color_update,
+    )
+}
+
 /// Process IFC content with parallel geometry extraction and a configurable opening filter.
 pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMode) -> ProcessingResult {
+    process_geometry_streaming_filtered_with_options(
+        content,
+        opening_filter,
+        StreamingOptions {
+            initial_batch_size: usize::MAX,
+            throughput_batch_size: usize::MAX,
+            ..StreamingOptions::default()
+        },
+        |_, _, _| {},
+        |_| {},
+    )
+}
+
+/// Process IFC content with parallel geometry extraction and a configurable streaming batch size.
+pub fn process_geometry_streaming_filtered(
+    content: &str,
+    opening_filter: OpeningFilterMode,
+    batch_size: usize,
+    on_batch: impl FnMut(&[MeshData], usize, usize),
+    on_color_update: impl FnMut(&[(u32, [f32; 4])]),
+) -> ProcessingResult {
+    process_geometry_streaming_filtered_with_options(
+        content,
+        opening_filter,
+        StreamingOptions {
+            initial_batch_size: batch_size,
+            throughput_batch_size: batch_size,
+            ..StreamingOptions::default()
+        },
+        on_batch,
+        on_color_update,
+    )
+}
+
+/// Process IFC content with parallel geometry extraction and configurable streaming behavior.
+pub fn process_geometry_streaming_filtered_with_options(
+    content: &str,
+    opening_filter: OpeningFilterMode,
+    options: StreamingOptions,
+    mut on_batch: impl FnMut(&[MeshData], usize, usize),
+    mut on_color_update: impl FnMut(&[(u32, [f32; 4])]),
+) -> ProcessingResult {
     let total_start = std::time::Instant::now();
     let parse_start = std::time::Instant::now();
+    let entity_scan_start = std::time::Instant::now();
 
     tracing::info!(
         content_size = content.len(),
@@ -411,15 +585,26 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
     let mut site_entity_pos: Option<(usize, usize)> = None;
     let mut building_entity_pos: Option<(usize, usize)> = None;
 
+    let defer_style_updates =
+        options.fast_first_batch &&
+        opening_filter == OpeningFilterMode::Default &&
+        !options.include_presentation_layers;
+
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
         total_entities += 1;
 
         if type_name == "IFCSTYLEDITEM" {
+            if defer_style_updates {
+                continue;
+            }
             if let Ok(styled_item) = decoder.decode_at(start, end) {
                 collect_geometry_style_info(&mut geometry_style_index, &styled_item, &mut decoder);
             }
             continue;
         } else if type_name == "IFCPRESENTATIONLAYERASSIGNMENT" {
+            if !options.include_presentation_layers {
+                continue;
+            }
             if let Ok(layer_assignment) = decoder.decode_at(start, end) {
                 collect_presentation_layer_assignments(
                     &mut presentation_layer_by_assigned_id,
@@ -428,6 +613,9 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
             }
             continue;
         } else if type_name == "IFCPROPERTYSET" {
+            if !options.include_properties {
+                continue;
+            }
             if let Ok(property_set) = decoder.decode_at(start, end) {
                 if let Some(definition) = collect_property_set_definition(&property_set) {
                     property_sets_by_id.insert(id, definition);
@@ -435,6 +623,9 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
             }
             continue;
         } else if type_name == "IFCRELDEFINESBYPROPERTIES" {
+            if !options.include_properties {
+                continue;
+            }
             if let Ok(rel_defines) = decoder.decode_at(start, end) {
                 if let Some(link) = collect_rel_defines_by_properties_link(&rel_defines) {
                     rel_defines_by_properties.push(link);
@@ -442,6 +633,9 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
             }
             continue;
         } else if type_name.starts_with("IFCPROPERTY") {
+            if !options.include_properties {
+                continue;
+            }
             if let Ok(property_entity) = decoder.decode_at(start, end) {
                 if let Some((name, value)) = extract_property_name_and_value(&property_entity) {
                     property_values_by_id.insert(id, (name, value));
@@ -470,40 +664,39 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
         }
 
         if ifc_lite_core::has_geometry_by_name(type_name) {
-            if let Ok(entity) = decoder.decode_at(start, end) {
-                let global_id = normalize_optional_string(entity.get_string(0));
-                let name = normalize_optional_string(entity.get_string(2));
-                let product_definition_shape_id = entity.get_ref(6);
-
-                entity_jobs.push(EntityJob {
-                    id,
-                    ifc_type: entity.ifc_type,
-                    start,
-                    end,
-                    product_definition_shape_id,
-                    element_color: get_default_color(&entity.ifc_type),
-                    global_id,
-                    name,
-                    presentation_layer: None,
-                    space_zone_properties: None,
-                });
-            }
+            let ifc_type = IfcType::from_str(type_name);
+            entity_jobs.push(EntityJob {
+                id,
+                ifc_type: ifc_type.clone(),
+                start,
+                end,
+                product_definition_shape_id: None,
+                element_color: get_default_color(&ifc_type),
+                global_id: None,
+                name: None,
+                presentation_layer: None,
+                space_zone_properties: None,
+            });
         }
     }
 
-    assign_space_zone_properties(
-        &mut entity_jobs,
-        &property_values_by_id,
-        &property_sets_by_id,
-        &rel_defines_by_properties,
-    );
+    let entity_scan_time = entity_scan_start.elapsed();
 
-    resolve_entity_lookups(
-        &mut entity_jobs,
-        &geometry_style_index,
-        &presentation_layer_by_assigned_id,
-        &mut decoder,
-    );
+    let lookup_start = std::time::Instant::now();
+    if options.include_properties {
+        assign_space_zone_properties(
+            &mut entity_jobs,
+            &property_values_by_id,
+            &property_sets_by_id,
+            &rel_defines_by_properties,
+        );
+    }
+    if options.fast_first_batch {
+        entity_jobs.sort_by(|left, right| {
+            geometry_priority_score(&right.ifc_type).cmp(&geometry_priority_score(&left.ifc_type))
+        });
+    }
+    let lookup_time = lookup_start.elapsed();
 
     let (skipped_entity_ids, filtered_void_index) = apply_opening_filter(
         &entity_jobs,
@@ -532,6 +725,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
     );
 
     // Preprocess complex geometry
+    let preprocess_start = std::time::Instant::now();
     let mut router = GeometryRouter::with_units(content, &mut decoder);
 
     // Resolve IfcSite and IfcBuilding placement transforms.
@@ -561,151 +755,106 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
         tracing::debug!(count = faceted_brep_ids.len(), "Preprocessing FacetedBreps");
         router.preprocess_faceted_breps(&faceted_brep_ids, &mut decoder);
     }
+    let preprocess_time = preprocess_start.elapsed();
 
     let parse_time = parse_start.elapsed();
     tracing::info!(
+        entity_scan_time_ms = entity_scan_time.as_millis(),
+        lookup_time_ms = lookup_time.as_millis(),
+        preprocess_time_ms = preprocess_time.as_millis(),
         parse_time_ms = parse_time.as_millis(),
         "Parse phase complete, starting geometry extraction"
     );
 
     // PARALLEL GEOMETRY PROCESSING
     let geometry_start = std::time::Instant::now();
-    let content_arc = Arc::new(content.to_string());
     let entity_index_arc = entity_index; // Already Arc from above
     let unit_scale = router.unit_scale();
     let rtc_offset = router.rtc_offset();
     let void_index_arc = Arc::new(filtered_void_index);
     let skipped_entity_ids = Arc::new(skipped_entity_ids);
-    let geometry_style_index = Arc::new(geometry_style_index);
+    let mut geometry_style_index = Arc::new(geometry_style_index);
 
-    let meshes: Vec<MeshData> = entity_jobs
-        .into_par_iter()
-        .flat_map_iter(|job| {
-            if skipped_entity_ids.contains(&job.id) {
-                return Vec::new();
-            }
+    let total_jobs = entity_jobs.len();
+    let initial_chunk_size = options.initial_batch_size.max(1);
+    let throughput_chunk_size = options
+        .throughput_batch_size
+        .max(initial_chunk_size);
+    let site_transform_arc = Arc::new(site_transform.clone());
+    let mut color_cache_by_product_definition_shape: FxHashMap<u32, Option<[f32; 4]>> =
+        FxHashMap::default();
+    let mut layer_cache_by_product_definition_shape: FxHashMap<u32, Option<String>> =
+        FxHashMap::default();
+    let mut layer_cache_by_representation: FxHashMap<u32, Option<String>> = FxHashMap::default();
+    let mut meshes: Vec<MeshData> = Vec::new();
+    let mut processed_jobs = 0usize;
+    let mut total_vertices = 0usize;
+    let mut total_triangles = 0usize;
+    let mut chunk_start = 0usize;
+    let mut current_chunk_size = initial_chunk_size;
 
-            let mut local_decoder =
-                EntityDecoder::with_arc_index(&content_arc, entity_index_arc.clone());
+    let mut deferred_styles_applied = !defer_style_updates;
 
-            let entity = match local_decoder.decode_at(job.start, job.end) {
-                Ok(entity) => entity,
-                Err(_) => return Vec::new(),
-            };
+    while chunk_start < total_jobs {
+        let chunk_end = (chunk_start + current_chunk_size).min(total_jobs);
+        let jobs_chunk = &mut entity_jobs[chunk_start..chunk_end];
+        for job in jobs_chunk.iter_mut() {
+            populate_entity_job_metadata(
+                job,
+                &geometry_style_index,
+                &presentation_layer_by_assigned_id,
+                &mut color_cache_by_product_definition_shape,
+                &mut layer_cache_by_product_definition_shape,
+                &mut layer_cache_by_representation,
+                &mut decoder,
+                options.include_presentation_layers,
+            );
+        }
+        let chunk_meshes: Vec<MeshData> = jobs_chunk
+            .par_iter()
+            .flat_map_iter(|job| {
+                process_entity_job(
+                    job,
+                    content,
+                    &entity_index_arc,
+                    unit_scale,
+                    rtc_offset,
+                    void_index_arc.as_ref(),
+                    skipped_entity_ids.as_ref(),
+                    geometry_style_index.as_ref(),
+                    site_transform_arc.as_ref(),
+                )
+            })
+            .collect();
 
-            let has_representation = entity.get(6).is_some_and(|a| !a.is_null());
-            if !has_representation {
-                return Vec::new();
-            }
+        processed_jobs += jobs_chunk.len();
+        total_vertices += chunk_meshes.iter().map(|m| m.vertex_count()).sum::<usize>();
+        total_triangles += chunk_meshes.iter().map(|m| m.triangle_count()).sum::<usize>();
 
-            let local_router = GeometryRouter::with_scale_and_rtc(unit_scale, rtc_offset);
-            let global_id = job.global_id.clone();
-            let name = job.name.clone();
-            let presentation_layer = job.presentation_layer.clone();
-            let space_zone_properties = job.space_zone_properties.clone();
-            let element_color = job.element_color;
+        if !chunk_meshes.is_empty() {
+            on_batch(&chunk_meshes, processed_jobs, total_jobs);
+            meshes.extend(chunk_meshes);
 
-            // Preserve subparts for openings so frame/glass can be emitted as distinct meshes.
-            if is_opening_with_subparts(&job.ifc_type) {
-                if let Ok(sub_meshes) =
-                    local_router.process_element_with_submeshes(&entity, &mut local_decoder)
-                {
-                    if !sub_meshes.is_empty() {
-                        let mut out: Vec<MeshData> = Vec::with_capacity(sub_meshes.len());
-
-                        for sub in sub_meshes.sub_meshes {
-                            let mut sub_mesh = sub.mesh;
-                            if sub_mesh.is_empty() {
-                                continue;
-                            }
-
-                            if sub_mesh.normals.is_empty() {
-                                calculate_normals(&mut sub_mesh);
-                            }
-
-                            let style = geometry_style_index.get(&sub.geometry_id);
-                            let color = style.map(|s| s.color).unwrap_or(element_color);
-                            let material_name = style
-                                .and_then(|s| s.material_name.as_ref())
-                                .map(ToString::to_string);
-                            let material_name = material_name.or_else(|| {
-                                infer_opening_subpart_material_name(
-                                    &job.ifc_type,
-                                    color,
-                                    sub.geometry_id,
-                                )
-                            });
-
-                            let mut mesh_data = MeshData::new(
-                                    job.id,
-                                    job.ifc_type.name().to_string(),
-                                    sub_mesh.positions,
-                                    sub_mesh.normals,
-                                    sub_mesh.indices,
-                                    color,
-                                )
-                                .with_element_metadata(
-                                    global_id.clone(),
-                                    name.clone(),
-                                    presentation_layer.clone(),
-                                )
-                                .with_properties(space_zone_properties.clone())
-                                .with_style_metadata(material_name, Some(sub.geometry_id));
-                            convert_mesh_to_site_local(&mut mesh_data, site_transform.as_ref());
-                            out.push(mesh_data);
-                        }
-
-                        if !out.is_empty() {
-                            return out;
-                        }
-                    }
+            if !deferred_styles_applied {
+                geometry_style_index = Arc::new(build_geometry_style_index(content, &entity_index_arc));
+                let deferred_color_updates = build_color_updates_for_jobs(
+                    &entity_jobs[..processed_jobs],
+                    geometry_style_index.as_ref(),
+                    content,
+                    &entity_index_arc,
+                );
+                if !deferred_color_updates.is_empty() {
+                    on_color_update(&deferred_color_updates);
                 }
+                deferred_styles_applied = true;
             }
-
-            let mut mesh_candidate = local_router
-                .process_element_with_voids(&entity, &mut local_decoder, void_index_arc.as_ref())
-                .ok();
-            let needs_fallback = match mesh_candidate.as_ref() {
-                Some(mesh) => mesh.is_empty(),
-                None => true,
-            };
-            if needs_fallback {
-                mesh_candidate = local_router
-                    .process_element(&entity, &mut local_decoder)
-                    .ok();
-            }
-
-            if let Some(mut mesh) = mesh_candidate {
-                if !mesh.is_empty() {
-                    if mesh.normals.is_empty() {
-                        calculate_normals(&mut mesh);
-                    }
-
-                    let mut mesh_data = MeshData::new(
-                        job.id,
-                        job.ifc_type.name().to_string(),
-                        mesh.positions,
-                        mesh.normals,
-                        mesh.indices,
-                        element_color,
-                    )
-                    .with_element_metadata(global_id, name, presentation_layer)
-                    .with_properties(space_zone_properties);
-                    convert_mesh_to_site_local(&mut mesh_data, site_transform.as_ref());
-                    return vec![mesh_data];
-                }
-            }
-
-            Vec::new()
-        })
-        .collect();
+        }
+        chunk_start = chunk_end;
+        current_chunk_size = throughput_chunk_size;
+    }
 
     let geometry_time = geometry_start.elapsed();
     let total_time = total_start.elapsed();
-
-    // Calculate stats
-    let total_vertices: usize = meshes.iter().map(|m| m.vertex_count()).sum();
-    let total_triangles: usize = meshes.iter().map(|m| m.triangle_count()).sum();
 
     tracing::info!(
         meshes = meshes.len(),
@@ -739,11 +888,129 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
             total_vertices,
             total_triangles,
             parse_time_ms: parse_time.as_millis() as u64,
+            entity_scan_time_ms: entity_scan_time.as_millis() as u64,
+            lookup_time_ms: lookup_time.as_millis() as u64,
+            preprocess_time_ms: preprocess_time.as_millis() as u64,
             geometry_time_ms: geometry_time.as_millis() as u64,
             total_time_ms: total_time.as_millis() as u64,
             from_cache: false,
         },
     }
+}
+
+fn process_entity_job(
+    job: &EntityJob,
+    content: &str,
+    entity_index_arc: &Arc<EntityIndex>,
+    unit_scale: f64,
+    rtc_offset: (f64, f64, f64),
+    void_index: &FxHashMap<u32, Vec<u32>>,
+    skipped_entity_ids: &HashSet<u32>,
+    geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
+    site_transform: &Option<Vec<f64>>,
+) -> Vec<MeshData> {
+    if skipped_entity_ids.contains(&job.id) {
+        return Vec::new();
+    }
+
+    let mut local_decoder = EntityDecoder::with_arc_index(content, entity_index_arc.clone());
+
+    let entity = match local_decoder.decode_at(job.start, job.end) {
+        Ok(entity) => entity,
+        Err(_) => return Vec::new(),
+    };
+
+    let has_representation = entity.get(6).is_some_and(|a| !a.is_null());
+    if !has_representation {
+        return Vec::new();
+    }
+
+    let local_router = GeometryRouter::with_scale_and_rtc(unit_scale, rtc_offset);
+    let global_id = job.global_id.clone();
+    let name = job.name.clone();
+    let presentation_layer = job.presentation_layer.clone();
+    let space_zone_properties = job.space_zone_properties.clone();
+    let element_color = job.element_color;
+
+    if is_opening_with_subparts(&job.ifc_type) {
+        if let Ok(sub_meshes) = local_router.process_element_with_submeshes(&entity, &mut local_decoder) {
+            if !sub_meshes.is_empty() {
+                let mut out: Vec<MeshData> = Vec::with_capacity(sub_meshes.len());
+
+                for sub in sub_meshes.sub_meshes {
+                    let mut sub_mesh = sub.mesh;
+                    if sub_mesh.is_empty() {
+                        continue;
+                    }
+
+                    if sub_mesh.normals.is_empty() {
+                        calculate_normals(&mut sub_mesh);
+                    }
+
+                    let style = geometry_style_index.get(&sub.geometry_id);
+                    let color = style.map(|s| s.color).unwrap_or(element_color);
+                    let material_name = style
+                        .and_then(|s| s.material_name.as_ref())
+                        .map(ToString::to_string);
+                    let material_name = material_name.or_else(|| {
+                        infer_opening_subpart_material_name(&job.ifc_type, color, sub.geometry_id)
+                    });
+
+                    let mut mesh_data = MeshData::new(
+                        job.id,
+                        job.ifc_type.name().to_string(),
+                        sub_mesh.positions,
+                        sub_mesh.normals,
+                        sub_mesh.indices,
+                        color,
+                    )
+                    .with_element_metadata(global_id.clone(), name.clone(), presentation_layer.clone())
+                    .with_properties(space_zone_properties.clone())
+                    .with_style_metadata(material_name, Some(sub.geometry_id));
+                    convert_mesh_to_site_local(&mut mesh_data, site_transform.as_ref());
+                    out.push(mesh_data);
+                }
+
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+    }
+
+    let mut mesh_candidate = local_router
+        .process_element_with_voids(&entity, &mut local_decoder, void_index)
+        .ok();
+    let needs_fallback = match mesh_candidate.as_ref() {
+        Some(mesh) => mesh.is_empty(),
+        None => true,
+    };
+    if needs_fallback {
+        mesh_candidate = local_router.process_element(&entity, &mut local_decoder).ok();
+    }
+
+    if let Some(mut mesh) = mesh_candidate {
+        if !mesh.is_empty() {
+            if mesh.normals.is_empty() {
+                calculate_normals(&mut mesh);
+            }
+
+            let mut mesh_data = MeshData::new(
+                job.id,
+                job.ifc_type.name().to_string(),
+                mesh.positions,
+                mesh.normals,
+                mesh.indices,
+                element_color,
+            )
+            .with_element_metadata(global_id, name, presentation_layer)
+            .with_properties(space_zone_properties);
+            convert_mesh_to_site_local(&mut mesh_data, site_transform.as_ref());
+            return vec![mesh_data];
+        }
+    }
+
+    Vec::new()
 }
 
 fn collect_geometry_style_info(
@@ -764,6 +1031,57 @@ fn collect_geometry_style_info(
     }
 }
 
+fn build_geometry_style_index(
+    content: &str,
+    entity_index: &Arc<EntityIndex>,
+) -> FxHashMap<u32, GeometryStyleInfo> {
+    let mut geometry_styles: FxHashMap<u32, GeometryStyleInfo> = FxHashMap::default();
+    let mut decoder = EntityDecoder::with_arc_index(content, entity_index.clone());
+    let mut scanner = EntityScanner::new(content);
+
+    while let Some((_id, type_name, start, end)) = scanner.next_entity() {
+        if type_name != "IFCSTYLEDITEM" {
+            continue;
+        }
+        if let Ok(styled_item) = decoder.decode_at(start, end) {
+            collect_geometry_style_info(&mut geometry_styles, &styled_item, &mut decoder);
+        }
+    }
+
+    geometry_styles
+}
+
+fn build_color_updates_for_jobs(
+    jobs: &[EntityJob],
+    geometry_styles: &FxHashMap<u32, GeometryStyleInfo>,
+    content: &str,
+    entity_index: &Arc<EntityIndex>,
+) -> Vec<(u32, [f32; 4])> {
+    let mut decoder = EntityDecoder::with_arc_index(content, entity_index.clone());
+    let mut updates: Vec<(u32, [f32; 4])> = Vec::new();
+
+    for job in jobs {
+        let Ok(entity) = decoder.decode_at(job.start, job.end) else {
+            continue;
+        };
+        let Some(product_definition_shape_id) = entity.get_ref(6) else {
+            continue;
+        };
+        let Some(color) = resolve_element_color_for_product_definition_shape(
+            product_definition_shape_id,
+            geometry_styles,
+            &mut decoder,
+        ) else {
+            continue;
+        };
+        if color != job.element_color {
+            updates.push((job.id, color));
+        }
+    }
+
+    updates
+}
+
 fn collect_presentation_layer_assignments(
     layer_by_assigned_representation: &mut FxHashMap<u32, String>,
     layer_assignment: &DecodedEntity,
@@ -780,50 +1098,6 @@ fn collect_presentation_layer_assignments(
         layer_by_assigned_representation
             .entry(assigned)
             .or_insert_with(|| layer_name.clone());
-    }
-}
-
-fn resolve_entity_lookups(
-    entity_jobs: &mut [EntityJob],
-    geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
-    layer_by_assigned_representation: &FxHashMap<u32, String>,
-    decoder: &mut EntityDecoder,
-) {
-    let mut color_cache_by_product_definition_shape: FxHashMap<u32, Option<[f32; 4]>> =
-        FxHashMap::default();
-    let mut layer_cache_by_product_definition_shape: FxHashMap<u32, Option<String>> =
-        FxHashMap::default();
-    let mut layer_cache_by_representation: FxHashMap<u32, Option<String>> = FxHashMap::default();
-
-    for job in entity_jobs.iter_mut() {
-        let Some(product_definition_shape_id) = job.product_definition_shape_id else {
-            continue;
-        };
-
-        let resolved_color = color_cache_by_product_definition_shape
-            .entry(product_definition_shape_id)
-            .or_insert_with(|| {
-                resolve_element_color_for_product_definition_shape(
-                    product_definition_shape_id,
-                    geometry_style_index,
-                    decoder,
-                )
-            });
-        if let Some(color) = resolved_color {
-            job.element_color = *color;
-        }
-
-        let resolved_layer = layer_cache_by_product_definition_shape
-            .entry(product_definition_shape_id)
-            .or_insert_with(|| {
-                resolve_presentation_layer_for_product_definition_shape(
-                    product_definition_shape_id,
-                    layer_by_assigned_representation,
-                    &mut layer_cache_by_representation,
-                    decoder,
-                )
-            });
-        job.presentation_layer = resolved_layer.clone();
     }
 }
 
@@ -1165,9 +1439,12 @@ fn is_opaque_opening(
     styles: &FxHashMap<u32, GeometryStyleInfo>,
     decoder: &mut EntityDecoder,
 ) -> bool {
+    let Ok(entity) = decoder.decode_at(job.start, job.end) else {
+        return true;
+    };
+
     // 1. Entity name contains "glas" → glazed.
-    if job
-        .name
+    if normalize_optional_string(entity.get_string(2))
         .as_deref()
         .map(|n| n.to_lowercase().contains("glas"))
         .unwrap_or(false)
@@ -1182,7 +1459,7 @@ fn is_opaque_opening(
         return false;
     }
 
-    let Some(product_shape_id) = job.product_definition_shape_id else {
+    let Some(product_shape_id) = entity.get_ref(6) else {
         return true; // No shape info — treat as opaque
     };
 

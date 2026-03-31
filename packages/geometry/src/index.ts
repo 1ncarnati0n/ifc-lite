@@ -60,7 +60,7 @@ import { IfcLiteMeshCollector } from './ifc-lite-mesh-collector.js';
 import { BufferBuilder } from './buffer-builder.js';
 import { CoordinateHandler } from './coordinate-handler.js';
 import { GeometryQuality } from './progressive-loader.js';
-import { createPlatformBridge, isTauri, type IPlatformBridge } from './platform-bridge.js';
+import { createPlatformBridge, isTauri, type GeometryStats as PlatformGeometryStats, type IPlatformBridge } from './platform-bridge.js';
 import type { GeometryResult, MeshData, CoordinateInfo } from './types.js';
 
 export interface GeometryProcessorOptions {
@@ -100,7 +100,13 @@ export function calculateDynamicBatchSize(
 export type StreamingGeometryEvent =
   | { type: 'start'; totalEstimate: number }
   | { type: 'model-open'; modelID: number }
-  | { type: 'batch'; meshes: MeshData[]; totalSoFar: number; coordinateInfo?: import('./types.js').CoordinateInfo }
+  | {
+      type: 'batch';
+      meshes: MeshData[];
+      totalSoFar: number;
+      coordinateInfo?: import('./types.js').CoordinateInfo;
+      nativeTelemetry?: import('./platform-bridge.js').NativeBatchTelemetry;
+    }
   | { type: 'colorUpdate'; updates: Map<number, [number, number, number, number]> }
   | { type: 'rtcOffset'; rtcOffset: { x: number; y: number; z: number }; hasRtc: boolean }
   | { type: 'complete'; totalMeshes: number; coordinateInfo: import('./types.js').CoordinateInfo };
@@ -117,6 +123,7 @@ export class GeometryProcessor {
   private bufferBuilder: BufferBuilder;
   private coordinateHandler: CoordinateHandler;
   private isNative: boolean = false;
+  private lastNativeStats: PlatformGeometryStats | null = null;
 
   constructor(options: GeometryProcessorOptions = {}) {
     this.bufferBuilder = new BufferBuilder();
@@ -269,17 +276,79 @@ export class GeometryProcessor {
     if (this.isNative && this.platformBridge) {
       // NATIVE PATH - Use Tauri streaming
       console.time('[GeometryProcessor] native-streaming');
+      const queuedEvents: Array<
+        | { type: 'batch'; meshes: MeshData[]; nativeTelemetry?: import('./platform-bridge.js').NativeBatchTelemetry }
+        | { type: 'colorUpdate'; updates: Map<number, [number, number, number, number]> }
+      > = [];
+      let resolvePending: (() => void) | null = null;
+      let completed = false;
+      let streamError: Error | null = null;
+      let completedTotalMeshes: number | undefined;
+      let totalMeshes = 0;
 
-      // For native, we do a single batch for now (streaming via events is complex)
-      // TODO: Implement proper streaming with Tauri events
-      const result = await this.platformBridge.processGeometry(content);
-      const totalMeshes = result.meshes.length;
+      const wake = () => {
+        if (resolvePending) {
+          resolvePending();
+          resolvePending = null;
+        }
+      };
 
-      this.coordinateHandler.processMeshesIncremental(result.meshes);
+      const streamingPromise = this.platformBridge.processGeometryStreaming(content, {
+        onBatch: (batch) => {
+          queuedEvents.push({ type: 'batch', meshes: batch.meshes, nativeTelemetry: batch.nativeTelemetry });
+          wake();
+        },
+        onColorUpdate: (updates) => {
+          queuedEvents.push({ type: 'colorUpdate', updates: new Map(updates) });
+          wake();
+        },
+        onComplete: (stats) => {
+          this.lastNativeStats = stats;
+          completedTotalMeshes = stats.totalMeshes;
+          completed = true;
+          wake();
+        },
+        onError: (error) => {
+          streamError = error;
+          completed = true;
+          wake();
+        },
+      });
+
+      while (!completed || queuedEvents.length > 0) {
+        while (queuedEvents.length > 0) {
+          const event = queuedEvents.shift()!;
+          if (event.type === 'colorUpdate') {
+            yield { type: 'colorUpdate', updates: event.updates };
+            continue;
+          }
+          this.coordinateHandler.processMeshesIncremental(event.meshes);
+          totalMeshes += event.meshes.length;
+          const coordinateInfo = this.coordinateHandler.getCurrentCoordinateInfo();
+          yield {
+            type: 'batch',
+            meshes: event.meshes,
+            totalSoFar: totalMeshes,
+            coordinateInfo: coordinateInfo || undefined,
+            nativeTelemetry: event.nativeTelemetry,
+          };
+        }
+
+        if (streamError) {
+          throw streamError;
+        }
+
+        if (!completed) {
+          await new Promise<void>((resolve) => {
+            resolvePending = resolve;
+          });
+        }
+      }
+
+      await streamingPromise;
+
       const coordinateInfo = this.coordinateHandler.getFinalCoordinateInfo();
-
-      yield { type: 'batch', meshes: result.meshes, totalSoFar: totalMeshes, coordinateInfo: coordinateInfo || undefined };
-      yield { type: 'complete', totalMeshes, coordinateInfo };
+      yield { type: 'complete', totalMeshes: completedTotalMeshes ?? totalMeshes, coordinateInfo };
 
       console.timeEnd('[GeometryProcessor] native-streaming');
     } else {
@@ -343,6 +412,105 @@ export class GeometryProcessor {
         : coordinateInfo;
       yield { type: 'complete', totalMeshes, coordinateInfo: finalCoordinateInfo };
     }
+  }
+
+  /**
+   * Stream geometry directly from a filesystem path in native desktop hosts.
+   * This avoids copying very large IFC files through JS and Tauri IPC.
+   */
+  async *processStreamingPath(
+    path: string,
+    estimatedBytes: number = 0
+  ): AsyncGenerator<StreamingGeometryEvent> {
+    if (!this.isNative) {
+      throw new Error('File-path geometry streaming is only available in native desktop builds');
+    }
+    if (!this.platformBridge) {
+      await this.init();
+    }
+    if (!this.platformBridge?.processGeometryStreamingPath) {
+      throw new Error('Native platform bridge does not support file-path streaming');
+    }
+
+    this.coordinateHandler.reset();
+
+    yield { type: 'start', totalEstimate: estimatedBytes > 0 ? estimatedBytes / 1000 : 0 };
+    await new Promise(resolve => setTimeout(resolve, 0));
+    yield { type: 'model-open', modelID: 0 };
+
+    const queuedEvents: Array<
+      | { type: 'batch'; meshes: MeshData[]; nativeTelemetry?: import('./platform-bridge.js').NativeBatchTelemetry }
+      | { type: 'colorUpdate'; updates: Map<number, [number, number, number, number]> }
+    > = [];
+    let resolvePending: (() => void) | null = null;
+    let completed = false;
+    let streamError: Error | null = null;
+    let completedTotalMeshes: number | undefined;
+    let totalMeshes = 0;
+
+    const wake = () => {
+      if (resolvePending) {
+        resolvePending();
+        resolvePending = null;
+      }
+    };
+
+    const streamingPromise = this.platformBridge.processGeometryStreamingPath(path, {
+      onBatch: (batch) => {
+        queuedEvents.push({ type: 'batch', meshes: batch.meshes, nativeTelemetry: batch.nativeTelemetry });
+        wake();
+      },
+      onColorUpdate: (updates) => {
+        queuedEvents.push({ type: 'colorUpdate', updates: new Map(updates) });
+        wake();
+      },
+      onComplete: (stats) => {
+        this.lastNativeStats = stats;
+        completedTotalMeshes = stats.totalMeshes;
+        completed = true;
+        wake();
+      },
+      onError: (error) => {
+        streamError = error;
+        completed = true;
+        wake();
+      },
+    });
+
+    while (!completed || queuedEvents.length > 0) {
+      while (queuedEvents.length > 0) {
+        const event = queuedEvents.shift()!;
+        if (event.type === 'colorUpdate') {
+          yield { type: 'colorUpdate', updates: event.updates };
+          continue;
+        }
+        this.coordinateHandler.processMeshesIncremental(event.meshes);
+        totalMeshes += event.meshes.length;
+        const coordinateInfo = this.coordinateHandler.getCurrentCoordinateInfo();
+        yield {
+          type: 'batch',
+          meshes: event.meshes,
+          totalSoFar: totalMeshes,
+          coordinateInfo: coordinateInfo || undefined,
+          nativeTelemetry: event.nativeTelemetry,
+        };
+      }
+
+      if (streamError) {
+        throw streamError;
+      }
+
+      if (!completed) {
+        await new Promise<void>((resolve) => {
+          resolvePending = resolve;
+        });
+      }
+    }
+
+    await streamingPromise;
+
+    const coordinateInfo = this.coordinateHandler.getFinalCoordinateInfo();
+    yield { type: 'complete', totalMeshes: completedTotalMeshes ?? totalMeshes, coordinateInfo };
   }
 
   /**
@@ -746,6 +914,10 @@ export class GeometryProcessor {
       return null;
     }
     return this.bridge.getApi();
+  }
+
+  getLastNativeStats(): PlatformGeometryStats | null {
+    return this.lastNativeStats;
   }
 
   /**

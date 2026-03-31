@@ -68,6 +68,9 @@ import { useFloorplanView } from '@/hooks/useFloorplanView';
 import { recordRecentFiles, cacheFileBlobs } from '@/lib/recent-files';
 import { ThemeSwitch } from './ThemeSwitch';
 import { toast } from '@/components/ui/toast';
+import { getStartupHarnessRequest, tryClaimStartupHarnessRequest } from '@/services/desktop-harness';
+import { logToDesktopTerminal } from '@/services/desktop-logger';
+import { openIfcFileDialog } from '@/services/file-dialog';
 
 type Tool = 'select' | 'walk' | 'measure' | 'section';
 type WorkspacePanel = 'script' | 'list' | 'bcf' | 'ids' | 'lens';
@@ -154,10 +157,40 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
   useEffect(() => {
     const handler = (e: Event) => {
       const file = (e as CustomEvent<File>).detail;
-      if (file) loadFile(file);
+      if (file) {
+        void loadFile(file);
+      }
     };
     window.addEventListener('ifc-lite:load-file', handler);
     return () => window.removeEventListener('ifc-lite:load-file', handler);
+  }, [loadFile]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      void logToDesktopTerminal('info', '[DesktopHarness] MainToolbar startup harness effect running');
+      const request = await getStartupHarnessRequest();
+      if (!request || cancelled) {
+        void logToDesktopTerminal(
+          'info',
+          `[DesktopHarness] No startup harness request available (cancelled=${cancelled})`
+        );
+        return;
+      }
+      if (!tryClaimStartupHarnessRequest(request)) {
+        void logToDesktopTerminal('info', `[DesktopHarness] Startup harness request already claimed for ${request.file.path}`);
+        return;
+      }
+      void logToDesktopTerminal('info', `[DesktopHarness] Claimed startup harness request for ${request.file.path}`);
+      console.log(`[DesktopHarness] Auto-loading startup file: ${request.file.path}`);
+      void logToDesktopTerminal('info', `[DesktopHarness] Calling loadFile for ${request.file.path}`);
+      await loadFile(request.file);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [loadFile]);
 
   // Floorplan view
@@ -547,9 +580,20 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <Button
             variant="ghost"
             size="icon-sm"
-            onClick={(e) => {
+            onClick={async (e) => {
               // Blur button to close tooltip before opening file dialog
               (e.currentTarget as HTMLButtonElement).blur();
+
+              void logToDesktopTerminal('info', '[MainToolbar] Open file button clicked');
+              const file = await openIfcFileDialog();
+              if (file) {
+                void logToDesktopTerminal('info', `[MainToolbar] Native dialog selected ${file.path}`);
+                recordRecentFiles([{ name: file.name, size: file.size }]);
+                loadFile(file);
+                return;
+              }
+
+              void logToDesktopTerminal('info', '[MainToolbar] Falling back to browser file input');
               fileInputRef.current?.click();
             }}
             disabled={loading}
@@ -949,8 +993,14 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
       {loading && progress && (
         <div className="flex items-center gap-2 mr-4">
           <span className="text-xs text-muted-foreground">{progress.phase}</span>
-          <Progress value={progress.percent} className="w-32 h-2" />
-          <span className="text-xs text-muted-foreground">{Math.round(progress.percent)}%</span>
+          {progress.indeterminate ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+          ) : (
+            <>
+              <Progress value={progress.percent} className="w-32 h-2" />
+              <span className="text-xs text-muted-foreground">{Math.round(progress.percent)}%</span>
+            </>
+          )}
         </div>
       )}
 

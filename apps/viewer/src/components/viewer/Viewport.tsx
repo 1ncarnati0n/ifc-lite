@@ -657,7 +657,7 @@ export function Viewport({ geometry, geometryVersion, coordinateInfo, computedIs
 
   // ===== Streaming progress =====
   const progress = useViewerStore((state) => state.progress);
-  const isStreaming = progress !== null && progress.percent < 100;
+  const isStreaming = progress !== null && (progress.indeterminate || progress.percent < 100);
 
   // Mouse isDragging proxy ref for animation loop
   // The animation loop reads this to decide whether to update rotation

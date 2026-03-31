@@ -10,6 +10,10 @@
 mod processor;
 mod types;
 
-pub use processor::{process_geometry, process_geometry_filtered, OpeningFilterMode, ProcessingResult};
+pub use processor::{
+    process_geometry, process_geometry_filtered, process_geometry_streaming,
+    process_geometry_streaming_filtered, process_geometry_streaming_filtered_with_options,
+    process_geometry_streaming_with_options, OpeningFilterMode, ProcessingResult, StreamingOptions,
+};
 pub use types::mesh::MeshData;
 pub use types::response::{CoordinateInfo, ModelMetadata, ParseResponse, ProcessingStats};

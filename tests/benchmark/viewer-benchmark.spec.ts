@@ -11,6 +11,11 @@ interface ViewerBenchmarkResult {
   file: string;
   sizeMB: number;
   timestamp: string;
+  environment: {
+    runtime: 'browser-wasm';
+    cacheMode: string;
+    buildMode: string;
+  };
   metrics: ViewerBenchmarkMetrics;
   thresholds: {
     passed: boolean;
@@ -185,6 +190,9 @@ test.describe('Viewer Performance Benchmarks', () => {
       console.log(`\n--- Geometry Streaming ---`);
       console.log(`  Model Open: ${metrics.modelOpenMs?.toFixed(0) || 'N/A'} ms`);
       console.log(`  First Batch Wait: ${metrics.firstBatchWaitMs?.toFixed(0) || 'N/A'} ms`);
+      console.log(`  First Append Batch: ${metrics.firstAppendGeometryBatchMs?.toFixed(0) || 'N/A'} ms`);
+      console.log(`  First Visible Geometry: ${metrics.firstVisibleGeometryMs?.toFixed(0) || 'N/A'} ms`);
+      console.log(`  Stream Complete: ${metrics.streamCompleteMs?.toFixed(0) || 'N/A'} ms`);
       console.log(`  First Batch Meshes: ${metrics.firstBatchMeshes?.toLocaleString() || 'N/A'}`);
       console.log(`  Total Batches: ${metrics.totalBatches?.toLocaleString() || 'N/A'}`);
       console.log(`  Total Meshes: ${metrics.totalMeshes?.toLocaleString() || 'N/A'}`);
@@ -193,6 +201,10 @@ test.describe('Viewer Performance Benchmarks', () => {
       console.log(`  JS Process: ${metrics.jsProcessMs?.toFixed(0) || 'N/A'} ms`);
 
       console.log(`\n--- Data Model Parsing ---`);
+      console.log(`  Metadata Start: ${metrics.metadataStartMs?.toFixed(0) || 'N/A'} ms`);
+      console.log(`  Spatial Ready: ${metrics.spatialReadyMs?.toFixed(0) || 'N/A'} ms`);
+      console.log(`  Metadata Complete: ${metrics.metadataCompleteMs?.toFixed(0) || 'N/A'} ms`);
+      console.log(`  Metadata Failed: ${metrics.metadataFailedMs?.toFixed(0) || 'N/A'} ms`);
       console.log(`  Entity Scan: ${metrics.entityScanMs?.toFixed(0) || 'N/A'} ms`);
       console.log(`  Entity Count: ${metrics.entityCount?.toLocaleString() || 'N/A'}`);
       console.log(`  Data Model Parse: ${metrics.dataModelParseMs?.toFixed(0) || 'N/A'} ms`);
@@ -242,6 +254,11 @@ test.describe('Viewer Performance Benchmarks', () => {
         file: fileName,
         sizeMB: metrics.fileSizeMB || 0,
         timestamp: new Date().toISOString(),
+        environment: {
+          runtime: 'browser-wasm',
+          cacheMode: process.env.VIEWER_BENCHMARK_CACHE_MODE ?? 'default',
+          buildMode: process.env.VIEWER_BENCHMARK_BUILD_MODE ?? 'dev',
+        },
         metrics,
         thresholds: thresholdResult,
       };

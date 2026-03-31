@@ -11,12 +11,12 @@ import type { StateCreator } from 'zustand';
 export interface LoadingSlice {
   // State
   loading: boolean;
-  progress: { phase: string; percent: number } | null;
+  progress: { phase: string; percent: number; indeterminate?: boolean } | null;
   error: string | null;
 
   // Actions
   setLoading: (loading: boolean) => void;
-  setProgress: (progress: { phase: string; percent: number } | null) => void;
+  setProgress: (progress: { phase: string; percent: number; indeterminate?: boolean } | null) => void;
   setError: (error: string | null) => void;
 }
 

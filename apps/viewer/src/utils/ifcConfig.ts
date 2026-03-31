@@ -65,7 +65,9 @@ export const THRESHOLDS = {
 // ============================================================================
 
 /** Detect if running in Tauri (desktop) environment */
-export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export function isTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
 
 // ============================================================================
 // Dynamic Batch Configuration

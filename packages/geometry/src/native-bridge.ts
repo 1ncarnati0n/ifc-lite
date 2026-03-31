@@ -15,6 +15,7 @@ import type {
   GeometryStats,
   StreamingOptions,
   GeometryBatch,
+  NativeBatchTelemetry,
 } from './platform-bridge.js';
 import type { MeshData, CoordinateInfo } from './types.js';
 
@@ -25,6 +26,32 @@ type ListenFn = <T>(event: string, handler: (event: { payload: T }) => void) => 
 // Tauri internals interface (set by Tauri runtime)
 interface TauriInternals {
   invoke: InvokeFn;
+}
+
+interface NativeStreamingProgress {
+  processed: number;
+  total: number;
+  currentType: string;
+}
+
+interface NativeBatchTelemetryPayload {
+  batchSequence: number;
+  payloadKind: string;
+  meshCount: number;
+  positionsLen: number;
+  normalsLen: number;
+  indicesLen: number;
+  chunkReadyTimeMs: number;
+  packTimeMs: number;
+  emitTimeMs: number;
+  emittedTimeMs: number;
+}
+
+interface NativeColorUpdatePayload {
+  updates: Array<{
+    expressId: number;
+    color: [number, number, number, number];
+  }>;
 }
 
 /**
@@ -96,6 +123,26 @@ export class NativeBridge implements IPlatformBridge {
     };
   }
 
+  async processGeometryPath(path: string): Promise<GeometryProcessingResult> {
+    if (!this.initialized || !this.invoke) {
+      await this.init();
+    }
+
+    const result = await this.invoke!<{
+      meshes: NativeMeshData[];
+      totalVertices: number;
+      totalTriangles: number;
+      coordinateInfo: NativeCoordinateInfo;
+    }>('get_geometry_from_path', { path });
+
+    return {
+      meshes: result.meshes.map(convertNativeMesh),
+      totalVertices: result.totalVertices,
+      totalTriangles: result.totalTriangles,
+      coordinateInfo: convertNativeCoordinateInfo(result.coordinateInfo),
+    };
+  }
+
   async processGeometryStreaming(
     content: string,
     options: StreamingOptions
@@ -113,7 +160,15 @@ export class NativeBridge implements IPlatformBridge {
         totalVertices: result.totalVertices,
         totalTriangles: result.totalTriangles,
         parseTimeMs: 0,
+        entityScanTimeMs: 0,
+        lookupTimeMs: 0,
+        preprocessTimeMs: 0,
         geometryTimeMs: 0,
+        totalTimeMs: 0,
+        firstChunkReadyTimeMs: 0,
+        firstChunkPackTimeMs: 0,
+        firstChunkEmittedTimeMs: 0,
+        firstChunkEmitTimeMs: 0,
       };
       // Emit single batch with all meshes
       options.onBatch?.({
@@ -129,9 +184,11 @@ export class NativeBridge implements IPlatformBridge {
     const buffer = Array.from(encoder.encode(content));
 
     // Listen for geometry batch events
+    const streamStartTime = performance.now();
     const unlisten = await this.listen<{
       meshes: NativeMeshData[];
-      progress: { processed: number; total: number; currentType: string };
+      progress: NativeStreamingProgress;
+      telemetry?: NativeBatchTelemetryPayload;
     }>('geometry-batch', (event) => {
       const batch: GeometryBatch = {
         meshes: event.payload.meshes.map(convertNativeMesh),
@@ -140,8 +197,36 @@ export class NativeBridge implements IPlatformBridge {
           total: event.payload.progress.total,
           currentType: event.payload.progress.currentType,
         },
+        nativeTelemetry: convertNativeBatchTelemetry(
+          event.payload.telemetry,
+          performance.now() - streamStartTime
+        ),
       };
       options.onBatch?.(batch);
+    });
+    const unlistenPacked = await this.listen<NativePackedGeometryBatch>('geometry-packed-batch', (event) => {
+      const batch: GeometryBatch = {
+        meshes: convertPackedNativeBatch(event.payload),
+        progress: {
+          processed: event.payload.progress.processed,
+          total: event.payload.progress.total,
+          currentType: event.payload.progress.currentType,
+        },
+        nativeTelemetry: convertNativeBatchTelemetry(
+          event.payload.telemetry,
+          performance.now() - streamStartTime
+        ),
+      };
+      options.onBatch?.(batch);
+    });
+    const unlistenColorUpdate = await this.listen<NativeColorUpdatePayload>('geometry-color-update', (event) => {
+      const updates = new Map<number, [number, number, number, number]>();
+      for (const entry of event.payload.updates) {
+        updates.set(entry.expressId, entry.color);
+      }
+      if (updates.size > 0) {
+        options.onColorUpdate?.(updates);
+      }
     });
 
     try {
@@ -151,7 +236,15 @@ export class NativeBridge implements IPlatformBridge {
         totalVertices: number;
         totalTriangles: number;
         parseTimeMs: number;
+        entityScanTimeMs?: number;
+        lookupTimeMs?: number;
+        preprocessTimeMs?: number;
         geometryTimeMs: number;
+        totalTimeMs?: number;
+        firstChunkReadyTimeMs?: number;
+        firstChunkPackTimeMs?: number;
+        firstChunkEmittedTimeMs?: number;
+        firstChunkEmitTimeMs?: number;
       }>('get_geometry_streaming', { buffer });
 
       const result: GeometryStats = {
@@ -159,7 +252,15 @@ export class NativeBridge implements IPlatformBridge {
         totalVertices: stats.totalVertices,
         totalTriangles: stats.totalTriangles,
         parseTimeMs: stats.parseTimeMs,
+        entityScanTimeMs: stats.entityScanTimeMs,
+        lookupTimeMs: stats.lookupTimeMs,
+        preprocessTimeMs: stats.preprocessTimeMs,
         geometryTimeMs: stats.geometryTimeMs,
+        totalTimeMs: stats.totalTimeMs,
+        firstChunkReadyTimeMs: stats.firstChunkReadyTimeMs,
+        firstChunkPackTimeMs: stats.firstChunkPackTimeMs,
+        firstChunkEmittedTimeMs: stats.firstChunkEmittedTimeMs,
+        firstChunkEmitTimeMs: stats.firstChunkEmitTimeMs,
       };
 
       options.onComplete?.(result);
@@ -170,6 +271,132 @@ export class NativeBridge implements IPlatformBridge {
     } finally {
       // Clean up event listener
       unlisten();
+      unlistenPacked();
+      unlistenColorUpdate();
+    }
+  }
+
+  async processGeometryStreamingPath(
+    path: string,
+    options: StreamingOptions
+  ): Promise<GeometryStats> {
+    if (!this.initialized || !this.invoke) {
+      await this.init();
+    }
+
+    if (!this.listen) {
+      console.warn('[NativeBridge] Event API unavailable, falling back to non-streaming file-path mode');
+      const result = await this.processGeometryPath(path);
+      const stats: GeometryStats = {
+        totalMeshes: result.meshes.length,
+        totalVertices: result.totalVertices,
+        totalTriangles: result.totalTriangles,
+        parseTimeMs: 0,
+        entityScanTimeMs: 0,
+        lookupTimeMs: 0,
+        preprocessTimeMs: 0,
+        geometryTimeMs: 0,
+        totalTimeMs: 0,
+        firstChunkReadyTimeMs: 0,
+        firstChunkPackTimeMs: 0,
+        firstChunkEmittedTimeMs: 0,
+        firstChunkEmitTimeMs: 0,
+      };
+      options.onBatch?.({
+        meshes: result.meshes,
+        progress: { processed: result.meshes.length, total: result.meshes.length, currentType: 'complete' },
+      });
+      options.onComplete?.(stats);
+      return stats;
+    }
+
+    const streamStartTime = performance.now();
+    const unlisten = await this.listen<{
+      meshes: NativeMeshData[];
+      progress: NativeStreamingProgress;
+      telemetry?: NativeBatchTelemetryPayload;
+    }>('geometry-batch', (event) => {
+      const batch: GeometryBatch = {
+        meshes: event.payload.meshes.map(convertNativeMesh),
+        progress: {
+          processed: event.payload.progress.processed,
+          total: event.payload.progress.total,
+          currentType: event.payload.progress.currentType,
+        },
+        nativeTelemetry: convertNativeBatchTelemetry(
+          event.payload.telemetry,
+          performance.now() - streamStartTime
+        ),
+      };
+      options.onBatch?.(batch);
+    });
+    const unlistenPacked = await this.listen<NativePackedGeometryBatch>('geometry-packed-batch', (event) => {
+      const batch: GeometryBatch = {
+        meshes: convertPackedNativeBatch(event.payload),
+        progress: {
+          processed: event.payload.progress.processed,
+          total: event.payload.progress.total,
+          currentType: event.payload.progress.currentType,
+        },
+        nativeTelemetry: convertNativeBatchTelemetry(
+          event.payload.telemetry,
+          performance.now() - streamStartTime
+        ),
+      };
+      options.onBatch?.(batch);
+    });
+    const unlistenColorUpdate = await this.listen<NativeColorUpdatePayload>('geometry-color-update', (event) => {
+      const updates = new Map<number, [number, number, number, number]>();
+      for (const entry of event.payload.updates) {
+        updates.set(entry.expressId, entry.color);
+      }
+      if (updates.size > 0) {
+        options.onColorUpdate?.(updates);
+      }
+    });
+
+    try {
+      const stats = await this.invoke!<{
+        totalMeshes: number;
+        totalVertices: number;
+        totalTriangles: number;
+        parseTimeMs: number;
+        entityScanTimeMs?: number;
+        lookupTimeMs?: number;
+        preprocessTimeMs?: number;
+        geometryTimeMs: number;
+        totalTimeMs?: number;
+        firstChunkReadyTimeMs?: number;
+        firstChunkPackTimeMs?: number;
+        firstChunkEmittedTimeMs?: number;
+        firstChunkEmitTimeMs?: number;
+      }>('get_geometry_streaming_from_path', { path });
+
+      const result: GeometryStats = {
+        totalMeshes: stats.totalMeshes,
+        totalVertices: stats.totalVertices,
+        totalTriangles: stats.totalTriangles,
+        parseTimeMs: stats.parseTimeMs,
+        entityScanTimeMs: stats.entityScanTimeMs,
+        lookupTimeMs: stats.lookupTimeMs,
+        preprocessTimeMs: stats.preprocessTimeMs,
+        geometryTimeMs: stats.geometryTimeMs,
+        totalTimeMs: stats.totalTimeMs,
+        firstChunkReadyTimeMs: stats.firstChunkReadyTimeMs,
+        firstChunkPackTimeMs: stats.firstChunkPackTimeMs,
+        firstChunkEmittedTimeMs: stats.firstChunkEmittedTimeMs,
+        firstChunkEmitTimeMs: stats.firstChunkEmitTimeMs,
+      };
+
+      options.onComplete?.(result);
+      return result;
+    } catch (error) {
+      options.onError?.(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    } finally {
+      unlisten();
+      unlistenPacked();
+      unlistenColorUpdate();
     }
   }
 
@@ -182,10 +409,32 @@ export class NativeBridge implements IPlatformBridge {
 // Native types from Rust (camelCase due to serde rename)
 interface NativeMeshData {
   expressId: number;
+  ifcType?: string;
   positions: number[];
   normals: number[];
   indices: number[];
   color: [number, number, number, number];
+}
+
+interface NativePackedMeshRange {
+  expressId: number;
+  ifcType?: string;
+  positionsOffset: number;
+  positionsLen: number;
+  normalsOffset: number;
+  normalsLen: number;
+  indicesOffset: number;
+  indicesLen: number;
+  color: [number, number, number, number];
+}
+
+interface NativePackedGeometryBatch {
+  meshes: NativePackedMeshRange[];
+  positions: number[];
+  normals: number[];
+  indices: number[];
+  progress: NativeStreamingProgress;
+  telemetry?: NativeBatchTelemetryPayload;
 }
 
 interface NativePoint3 {
@@ -210,10 +459,51 @@ interface NativeCoordinateInfo {
 function convertNativeMesh(native: NativeMeshData): MeshData {
   return {
     expressId: native.expressId,
+    ifcType: native.ifcType,
     positions: new Float32Array(native.positions),
     normals: new Float32Array(native.normals),
     indices: new Uint32Array(native.indices),
     color: native.color,
+  };
+}
+
+function convertPackedNativeBatch(native: NativePackedGeometryBatch): MeshData[] {
+  return native.meshes.map((mesh) => ({
+    expressId: mesh.expressId,
+    ifcType: mesh.ifcType,
+    positions: new Float32Array(
+      native.positions.slice(mesh.positionsOffset, mesh.positionsOffset + mesh.positionsLen)
+    ),
+    normals: new Float32Array(
+      native.normals.slice(mesh.normalsOffset, mesh.normalsOffset + mesh.normalsLen)
+    ),
+    indices: new Uint32Array(
+      native.indices.slice(mesh.indicesOffset, mesh.indicesOffset + mesh.indicesLen)
+    ),
+    color: mesh.color,
+  }));
+}
+
+function convertNativeBatchTelemetry(
+  telemetry: NativeBatchTelemetryPayload | undefined,
+  jsReceivedTimeMs: number
+): NativeBatchTelemetry | undefined {
+  if (!telemetry) {
+    return undefined;
+  }
+
+  return {
+    batchSequence: telemetry.batchSequence,
+    payloadKind: telemetry.payloadKind,
+    meshCount: telemetry.meshCount,
+    positionsLen: telemetry.positionsLen,
+    normalsLen: telemetry.normalsLen,
+    indicesLen: telemetry.indicesLen,
+    chunkReadyTimeMs: telemetry.chunkReadyTimeMs,
+    packTimeMs: telemetry.packTimeMs,
+    emitTimeMs: telemetry.emitTimeMs,
+    emittedTimeMs: telemetry.emittedTimeMs,
+    jsReceivedTimeMs,
   };
 }
 

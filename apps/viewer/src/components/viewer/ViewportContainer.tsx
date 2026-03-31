@@ -14,6 +14,8 @@ import { toGlobalIdFromModels } from '@/store/globalId';
 import { collectIfcBuildingStoreyElementsWithIfcSpace } from '@/store/basketVisibleSet';
 import { useIfc } from '@/hooks/useIfc';
 import { useWebGPU } from '@/hooks/useWebGPU';
+import { openIfcFileDialog } from '@/services/file-dialog';
+import { logToDesktopTerminal } from '@/services/desktop-logger';
 import { Upload, MousePointer, Layers, Info, Command, AlertTriangle, ChevronDown, ExternalLink, Plus } from 'lucide-react';
 import type { MeshData, CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
 
@@ -531,7 +533,22 @@ export function ViewportContainer() {
 
             {/* Action */}
             <button
-              onClick={() => webgpu.supported && fileInputRef.current?.click()}
+              onClick={async () => {
+                if (!webgpu.supported) {
+                  return;
+                }
+
+                void logToDesktopTerminal('info', '[ViewportContainer] Empty-state open button clicked');
+                const file = await openIfcFileDialog();
+                if (file) {
+                  void logToDesktopTerminal('info', `[ViewportContainer] Native dialog selected ${file.path}`);
+                  loadFile(file);
+                  return;
+                }
+
+                void logToDesktopTerminal('info', '[ViewportContainer] Falling back to browser file input');
+                fileInputRef.current?.click();
+              }}
               disabled={!webgpu.supported || webgpu.checking}
               className={`group w-full flex items-center justify-center gap-3 px-6 py-3 font-mono text-sm border transition-all ${
                 !webgpu.supported || webgpu.checking
