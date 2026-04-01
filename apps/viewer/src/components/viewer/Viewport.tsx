@@ -46,9 +46,19 @@ interface ViewportProps {
   coordinateInfo?: CoordinateInfo;
   computedIsolatedIds?: Set<number> | null;
   modelIdToIndex?: Map<string, number>;
+  releaseGeometryAfterStream?: boolean;
+  onGeometryReleased?: () => void;
 }
 
-export function Viewport({ geometry, geometryVersion, coordinateInfo, computedIsolatedIds, modelIdToIndex }: ViewportProps) {
+export function Viewport({
+  geometry,
+  geometryVersion,
+  coordinateInfo,
+  computedIsolatedIds,
+  modelIdToIndex,
+  releaseGeometryAfterStream = false,
+  onGeometryReleased,
+}: ViewportProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
@@ -94,7 +104,7 @@ export function Viewport({ geometry, geometryVersion, coordinateInfo, computedIs
   }, [modelIdToIndex]);
 
   // Compute selectedModelIndex for renderer (multi-model selection highlighting)
-  const selectedModelIndex = selectedEntity && modelIdToIndex
+  const selectedModelIndex = models.size > 1 && selectedEntity && modelIdToIndex
     ? modelIdToIndex.get(selectedEntity.modelId) ?? undefined
     : undefined;
 
@@ -656,8 +666,7 @@ export function Viewport({ geometry, geometryVersion, coordinateInfo, computedIs
   const showHiddenLines = useViewerStore((s) => s.drawing2DDisplayOptions.showHiddenLines);
 
   // ===== Streaming progress =====
-  const progress = useViewerStore((state) => state.progress);
-  const isStreaming = progress !== null && (progress.indeterminate || progress.percent < 100);
+  const isStreaming = useViewerStore((state) => state.geometryStreamingActive);
 
   // Mouse isDragging proxy ref for animation loop
   // The animation loop reads this to decide whether to update rotation
@@ -808,6 +817,8 @@ export function Viewport({ geometry, geometryVersion, coordinateInfo, computedIs
     clearPendingColorUpdates,
     clearPendingMeshColorUpdates,
     clearColorRef,
+    releaseGeometryAfterFinalize: releaseGeometryAfterStream,
+    onGeometryReleased,
   });
 
   useRenderUpdates({

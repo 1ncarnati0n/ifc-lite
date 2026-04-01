@@ -125,7 +125,12 @@ export interface IPlatformBridge {
   /**
    * Stream IFC geometry directly from a filesystem path when supported.
    */
-  processGeometryStreamingPath?(path: string, options: StreamingOptions): Promise<GeometryStats>;
+  processGeometryStreamingPath?(path: string, options: StreamingOptions, cacheKey?: string): Promise<GeometryStats>;
+
+  /**
+   * Stream previously cached native desktop geometry by cache key.
+   */
+  processGeometryStreamingCache?(cacheKey: string, options: StreamingOptions): Promise<GeometryStats>;
 
   /**
    * Get the underlying API object (for advanced usage)

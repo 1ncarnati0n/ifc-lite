@@ -29,6 +29,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { useIfc } from '@/hooks/useIfc';
+import { getNativeEntityDetails } from '@/services/desktop-native-metadata';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { IfcQuery } from '@ifc-lite/query';
 import { MutablePropertyView } from '@ifc-lite/mutations';
@@ -103,7 +104,7 @@ export function PropertiesPanel() {
       const m = models.get(selectedEntity.modelId);
       if (m) {
         return {
-          modelQuery: new IfcQuery(m.ifcDataStore),
+          modelQuery: m.ifcDataStore ? new IfcQuery(m.ifcDataStore) : null,
           model: m,
         };
       }
@@ -123,7 +124,7 @@ export function PropertiesPanel() {
 
   // Ensure mutation view exists for editing - creates it on-demand if needed
   useEffect(() => {
-    if (!model || !selectedEntity || selectedEntity.modelId === 'legacy') return;
+    if (!model || !model.ifcDataStore || !selectedEntity || selectedEntity.modelId === 'legacy') return;
 
     const modelId = selectedEntity.modelId;
     let mutationView = getMutationView(modelId);
@@ -142,9 +143,28 @@ export function PropertiesPanel() {
   const [copied, setCopied] = useState(false);
   const [coordCopied, setCoordCopied] = useState<string | null>(null);
   const [coordOpen, setCoordOpen] = useState(false);
+  const [nativeDetails, setNativeDetails] = useState<import('@/store/types').NativeMetadataEntityDetails | null>(null);
 
   // Edit mode toggle - allows inline property editing
   const [editMode, setEditMode] = useState(false);
+
+  useEffect(() => {
+    if (!selectedEntity || !model?.nativeMetadata) {
+      setNativeDetails(null);
+      return;
+    }
+    let cancelled = false;
+    void getNativeEntityDetails(model.nativeMetadata.cacheKey, selectedEntity.expressId)
+      .then((details) => {
+        if (!cancelled) setNativeDetails(details);
+      })
+      .catch(() => {
+        if (!cancelled) setNativeDetails(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedEntity, model?.nativeMetadata]);
 
   const copyToClipboard = useCallback((text: string) => {
     navigator.clipboard.writeText(text);
@@ -776,6 +796,122 @@ export function PropertiesPanel() {
         models={models}
         ifcDataStore={ifcDataStore}
       />
+    );
+  }
+
+  if (selectedEntity && model?.nativeMetadata) {
+    const entityType = nativeDetails?.summary.type ?? 'Loading...';
+    const entityName = nativeDetails?.summary.name ?? `#${selectedEntity.expressId}`;
+    const entityGlobalId = nativeDetails?.summary.globalId ?? null;
+    return (
+      <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
+        <div className="p-4 border-b-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black space-y-3">
+          <div className="flex items-start gap-3">
+            <div className="p-2 border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shrink-0 shadow-[2px_2px_0px_0px_rgba(0,0,0,0.1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,0.1)]">
+              <Building2 className="h-5 w-5 text-zinc-700 dark:text-zinc-300" />
+            </div>
+            <div className="flex-1 min-w-0 pt-0.5">
+              <h3 className="font-bold text-sm truncate uppercase tracking-tight text-zinc-900 dark:text-zinc-100">
+                {entityName}
+              </h3>
+              <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400">{entityType}</p>
+            </div>
+            <div className="flex gap-1 shrink-0">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon" className="h-8 w-8 rounded-none border border-zinc-200 dark:border-zinc-800" onClick={() => entityGlobalId && copyToClipboard(entityGlobalId)}>
+                    {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Copy GUID</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 rounded-none border border-zinc-200 dark:border-zinc-800"
+                    onClick={() => cameraCallbacks.frameSelection?.()}
+                    disabled={!selectedEntityId || !cameraCallbacks.frameSelection}
+                  >
+                    <Focus className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Frame selection</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 rounded-none border border-zinc-200 dark:border-zinc-800"
+                    onClick={() => selectedEntityId && toggleEntityVisibility(selectedEntityId)}
+                    disabled={!selectedEntityId}
+                  >
+                    {selectedEntityId && isEntityVisible(selectedEntityId) ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{selectedEntityId && isEntityVisible(selectedEntityId) ? 'Hide' : 'Show'}</TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
+          {entityGlobalId && (
+            <div className="text-[11px] font-mono text-zinc-500 dark:text-zinc-400 break-all">
+              {entityGlobalId}
+            </div>
+          )}
+        </div>
+        <ScrollArea className="flex-1">
+          <div className="p-3 space-y-3">
+            {nativeDetails?.typeSummary && (
+              <div className="border-2 border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-950">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Type</div>
+                <div className="text-sm font-medium">{nativeDetails.typeSummary.name}</div>
+                <div className="text-xs font-mono text-zinc-500">{nativeDetails.typeSummary.type}</div>
+              </div>
+            )}
+            {nativeDetails?.spatial?.storeyName && (
+              <div className="border-2 border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-950">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Storey</div>
+                <div className="text-sm font-medium">{nativeDetails.spatial.storeyName}</div>
+              </div>
+            )}
+            {(nativeDetails?.properties ?? []).map((pset) => (
+              <div key={pset.name} className="border-2 border-zinc-200 dark:border-zinc-800 p-3 bg-white dark:bg-zinc-950">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-2">{pset.name}</div>
+                <div className="space-y-1">
+                  {pset.properties.map((property) => (
+                    <div key={`${pset.name}-${property.name}`} className="flex items-start justify-between gap-3 text-sm">
+                      <span className="text-zinc-600 dark:text-zinc-400">{property.name}</span>
+                      <span className="text-right font-mono break-all">{String(property.value ?? '')}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {(nativeDetails?.quantities ?? []).map((qset) => (
+              <div key={qset.name} className="border-2 border-zinc-200 dark:border-zinc-800 p-3 bg-white dark:bg-zinc-950">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-2">{qset.name}</div>
+                <div className="space-y-1">
+                  {qset.quantities.map((quantity) => (
+                    <div key={`${qset.name}-${quantity.name}`} className="flex items-start justify-between gap-3 text-sm">
+                      <span className="text-zinc-600 dark:text-zinc-400">{quantity.name}</span>
+                      <span className="text-right font-mono">{quantity.value}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {!nativeDetails && (
+              <div className="text-xs text-zinc-500">Loading on-demand properties...</div>
+            )}
+          </div>
+        </ScrollArea>
+      </div>
     );
   }
 

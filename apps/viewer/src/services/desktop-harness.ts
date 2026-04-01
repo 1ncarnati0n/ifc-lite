@@ -12,6 +12,7 @@ interface TauriInternals {
 
 export interface DesktopHarnessRequest {
   file: NativeFileHandle;
+  replaceFile?: NativeFileHandle;
   telemetryOutputPath?: string;
   runLabel?: string;
   exitAfterTelemetry: boolean;
@@ -65,6 +66,7 @@ async function consumeStartupHarnessRequest(): Promise<DesktopHarnessRequest | n
 function getHarnessRequestFingerprint(request: DesktopHarnessRequest): string {
   return JSON.stringify({
     path: request.file.path,
+    replacePath: request.replaceFile?.path ?? null,
     telemetryOutputPath: request.telemetryOutputPath ?? null,
     runLabel: request.runLabel ?? null,
     exitAfterTelemetry: request.exitAfterTelemetry,

@@ -104,7 +104,7 @@ export type ViewerState = LoadingSlice &
 /**
  * Main viewer store combining all slices
  */
-export const useViewerStore = create<ViewerState>()((...args) => ({
+const createViewerStore = () => create<ViewerState>()((...args) => ({
   // Spread all slices
   ...createLoadingSlice(...args),
   ...createSelectionSlice(...args),
@@ -157,6 +157,13 @@ export const useViewerStore = create<ViewerState>()((...args) => ({
       isolatedEntitiesByModel: new Map(),
 
       // Data
+      loading: false,
+      geometryStreamingActive: false,
+      geometryUpdateTick: 0,
+      progress: null,
+      geometryProgress: null,
+      metadataProgress: null,
+      error: null,
       pendingColorUpdates: null,
       pendingMeshColorUpdates: null,
 
@@ -317,3 +324,16 @@ export const useViewerStore = create<ViewerState>()((...args) => ({
     });
   },
 }));
+
+const STORE_SINGLETON_KEY = '__ifc_lite_viewer_store__';
+const globalStoreRegistry = globalThis as typeof globalThis & {
+  [STORE_SINGLETON_KEY]?: ReturnType<typeof createViewerStore>;
+};
+
+export function getViewerStoreApi() {
+  return globalStoreRegistry[STORE_SINGLETON_KEY] ?? (
+    globalStoreRegistry[STORE_SINGLETON_KEY] = createViewerStore()
+  );
+}
+
+export const useViewerStore = getViewerStoreApi();

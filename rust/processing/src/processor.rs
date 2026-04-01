@@ -832,7 +832,10 @@ pub fn process_geometry_streaming_filtered_with_options(
         total_triangles += chunk_meshes.iter().map(|m| m.triangle_count()).sum::<usize>();
 
         if !chunk_meshes.is_empty() {
-            on_batch(&chunk_meshes, processed_jobs, total_jobs);
+            let emit_mesh_chunk_size = current_chunk_size.max(1);
+            for emitted_meshes in chunk_meshes.chunks(emit_mesh_chunk_size) {
+                on_batch(emitted_meshes, processed_jobs, total_jobs);
+            }
             meshes.extend(chunk_meshes);
 
             if !deferred_styles_applied {

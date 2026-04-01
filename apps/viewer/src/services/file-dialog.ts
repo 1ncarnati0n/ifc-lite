@@ -8,6 +8,7 @@ export interface NativeFileHandle {
   path: string;
   name: string;
   size: number;
+  modifiedMs?: number | null;
 }
 
 async function loadInvokeFromTauriModule(): Promise<InvokeFn | null> {
@@ -101,6 +102,13 @@ export async function openIfcFileDialog(): Promise<NativeFileHandle | null> {
 }
 
 export async function readNativeFile(path: string): Promise<Uint8Array> {
-  const fs = await import('@tauri-apps/plugin-fs');
-  return fs.readFile(path);
+  try {
+    const invoke = await getInvoke();
+    const bytes = await invoke<number[]>('read_native_file', { path });
+    return Uint8Array.from(bytes);
+  } catch (error) {
+    console.warn('[FileDialog] Falling back to plugin-fs read for native file:', error);
+    const fs = await import('@tauri-apps/plugin-fs');
+    return fs.readFile(path);
+  }
 }

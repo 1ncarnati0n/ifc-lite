@@ -44,6 +44,8 @@ export class Scene {
   private activeBucketKey: Map<string, string> = new Map(); // base colorKey -> current active bucket key
   private nextSplitId: number = 0; // Monotonic counter for sub-bucket keys
   private cachedMaxBufferSize: number = 0; // device.limits.maxBufferSize * safety factor (set on first use)
+  private static readonly STREAMING_FRAGMENT_MAX_INDICES = 180_000;
+  private static readonly STREAMING_FRAGMENT_MAX_VERTEX_BYTES = 8 * 1024 * 1024;
 
   // Sub-batch cache for partially visible batches (PERFORMANCE FIX)
   // Key = colorKey + ":" + sorted visible expressIds hash
@@ -74,6 +76,7 @@ export class Scene {
   // Only lightweight metadata is retained for operations that don't need
   // raw vertex data (bounding boxes, color key lookups, expressId sets).
   private geometryReleased: boolean = false;
+  private ephemeralStreamingMode: boolean = false;
 
   /**
    * Add mesh to scene
@@ -262,28 +265,34 @@ export class Scene {
       this.cachedMaxBufferSize = this.getMaxBufferSize(device);
     }
 
+    const retainStreamingGeometry = !(isStreaming && this.ephemeralStreamingMode);
+
     // Route each mesh into a size-aware bucket for its color
     for (const meshData of meshDataArray) {
       const baseKey = this.colorKey(meshData.color);
       const bucketKey = this.resolveActiveBucket(baseKey, meshData);
 
-      // Accumulate mesh data in the bucket (always — needed for final merge)
-      let bucket = this.buckets.get(bucketKey);
-      if (!bucket) {
-        bucket = { key: bucketKey, meshData: [], batchedMesh: null, vertexBytes: 0 };
-        this.buckets.set(bucketKey, bucket);
-      }
-      bucket.meshData.push(meshData);
+      if (retainStreamingGeometry || !isStreaming) {
+        // Accumulate mesh data in the bucket when we need later rebatching or
+        // CPU-side lookups. Huge-file mode intentionally skips this to keep JS
+        // memory bounded while fragments render directly from GPU batches.
+        let bucket = this.buckets.get(bucketKey);
+        if (!bucket) {
+          bucket = { key: bucketKey, meshData: [], batchedMesh: null, vertexBytes: 0 };
+          this.buckets.set(bucketKey, bucket);
+        }
+        bucket.meshData.push(meshData);
 
-      // Track reverse mapping for O(1) bucket lookup in updateMeshColors
-      this.meshDataBucket.set(meshData, bucket);
+        // Track reverse mapping for O(1) bucket lookup in updateMeshColors
+        this.meshDataBucket.set(meshData, bucket);
 
-      // Also store individual mesh data for visibility filtering
-      this.addMeshData(meshData);
+        // Also store individual mesh data for visibility filtering
+        this.addMeshData(meshData);
 
-      // Track pending keys for non-streaming rebuild only
-      if (!isStreaming) {
-        this.pendingBatchKeys.add(bucketKey);
+        // Track pending keys for non-streaming rebuild only
+        if (!isStreaming) {
+          this.pendingBatchKeys.add(bucketKey);
+        }
       }
     }
 
@@ -361,13 +370,20 @@ export class Scene {
    */
   queueMeshes(meshes: MeshData[]): void {
     for (let i = 0; i < meshes.length; i++) {
-      this.meshQueue.push(meshes[i]);
+      const fragments = this.splitMeshForStreaming(meshes[i]);
+      for (let j = 0; j < fragments.length; j++) {
+        this.meshQueue.push(fragments[j]);
+      }
     }
   }
 
   /** True if the mesh queue has pending work. */
   hasQueuedMeshes(): boolean {
     return this.meshQueue.length > 0;
+  }
+
+  setEphemeralStreamingMode(enabled: boolean): void {
+    this.ephemeralStreamingMode = enabled;
   }
 
   /**
@@ -380,13 +396,30 @@ export class Scene {
   flushPending(device: GPUDevice, pipeline: RenderPipeline): boolean {
     if (this.meshQueue.length === 0) return false;
 
-    // Drain the entire queue in one appendToBatches call.
-    // The queue coalesces multiple React batches into a single GPU upload,
-    // which is already bounded by the WASM→JS batch interval (~50-200ms).
-    const meshes = this.meshQueue;
-    this.meshQueue = [];
-    this.appendToBatches(meshes, device, pipeline, true);
-    return true;
+    // Drain the queue in moderately sized chunks instead of one mesh at a time.
+    // This preserves the per-frame time budget while cutting appendToBatches()
+    // overhead and front-of-array churn during huge desktop streams.
+    const MAX_MESHES_PER_FLUSH = 4096;
+    const MESHES_PER_APPEND = 128;
+    const FLUSH_BUDGET_MS = 10;
+    const start = performance.now();
+    let processed = 0;
+
+    while (this.meshQueue.length > 0 && processed < MAX_MESHES_PER_FLUSH) {
+      const chunkSize = Math.min(
+        MESHES_PER_APPEND,
+        MAX_MESHES_PER_FLUSH - processed,
+        this.meshQueue.length,
+      );
+      const chunk = this.meshQueue.splice(0, chunkSize);
+      this.appendToBatches(chunk, device, pipeline, true);
+      processed += chunk.length;
+      if (processed >= MESHES_PER_APPEND && performance.now() - start >= FLUSH_BUDGET_MS) {
+        break;
+      }
+    }
+
+    return processed > 0;
   }
 
   /**
@@ -400,13 +433,15 @@ export class Scene {
     // Group new meshes by color for efficient fragment batches
     const colorGroups = new Map<string, MeshData[]>();
     for (const meshData of meshDataArray) {
-      const key = this.colorKey(meshData.color);
-      let group = colorGroups.get(key);
-      if (!group) {
-        group = [];
-        colorGroups.set(key, group);
+      for (const fragment of this.splitMeshForStreaming(meshData)) {
+        const key = this.colorKey(fragment.color);
+        let group = colorGroups.get(key);
+        if (!group) {
+          group = [];
+          colorGroups.set(key, group);
+        }
+        group.push(fragment);
       }
-      group.push(meshData);
     }
 
     // Create one fragment batch per color group (with buffer limit splitting)
@@ -419,6 +454,60 @@ export class Scene {
         this.streamingFragments.push(fragment);
       }
     }
+  }
+
+  private splitMeshForStreaming(meshData: MeshData): MeshData[] {
+    const vertexBytes = meshData.positions.byteLength + meshData.normals.byteLength;
+    if (
+      meshData.indices.length <= Scene.STREAMING_FRAGMENT_MAX_INDICES &&
+      vertexBytes <= Scene.STREAMING_FRAGMENT_MAX_VERTEX_BYTES
+    ) {
+      return [meshData];
+    }
+
+    const maxIndexCount = Math.max(3, Math.floor(Scene.STREAMING_FRAGMENT_MAX_INDICES / 3) * 3);
+    const fragments: MeshData[] = [];
+
+    for (let start = 0; start < meshData.indices.length; start += maxIndexCount) {
+      const end = Math.min(start + maxIndexCount, meshData.indices.length);
+      const sourceIndices = meshData.indices.subarray(start, end);
+      const remap = new Map<number, number>();
+      const positions: number[] = [];
+      const normals: number[] = [];
+      const indices = new Uint32Array(sourceIndices.length);
+
+      for (let i = 0; i < sourceIndices.length; i++) {
+        const sourceIndex = sourceIndices[i];
+        let nextIndex = remap.get(sourceIndex);
+        if (nextIndex === undefined) {
+          nextIndex = remap.size;
+          remap.set(sourceIndex, nextIndex);
+          const base = sourceIndex * 3;
+          positions.push(
+            meshData.positions[base],
+            meshData.positions[base + 1],
+            meshData.positions[base + 2]
+          );
+          normals.push(
+            meshData.normals[base],
+            meshData.normals[base + 1],
+            meshData.normals[base + 2]
+          );
+        }
+        indices[i] = nextIndex;
+      }
+
+      fragments.push({
+        expressId: meshData.expressId,
+        ifcType: meshData.ifcType,
+        positions: new Float32Array(positions),
+        normals: new Float32Array(normals),
+        indices,
+        color: meshData.color,
+      });
+    }
+
+    return fragments;
   }
 
   /**
@@ -522,6 +611,10 @@ export class Scene {
     pipeline: RenderPipeline,
     budgetMs: number = 8,
   ): Promise<void> {
+    if (this.ephemeralStreamingMode) {
+      this.finishEphemeralStreaming();
+      return Promise.resolve();
+    }
     if (this.streamingFragments.length === 0) return Promise.resolve();
 
     // --- Synchronous preamble (fast O(N) bookkeeping) ---
@@ -618,6 +711,30 @@ export class Scene {
       // Start first chunk immediately (no setTimeout delay)
       processChunk();
     });
+  }
+
+  finishEphemeralStreaming(): void {
+    if (this.streamingFragments.length === 0) {
+      this.ephemeralStreamingMode = false;
+      return;
+    }
+
+    this.streamingFragments = [];
+    this.buckets.clear();
+    this.meshDataBucket = new Map();
+    this.meshDataMap.clear();
+    this.boundingBoxes.clear();
+    this.activeBucketKey.clear();
+    this.pendingBatchKeys.clear();
+    for (const batch of this.partialBatchCache.values()) {
+      batch.vertexBuffer.destroy();
+      batch.indexBuffer.destroy();
+      if (batch.uniformBuffer) batch.uniformBuffer.destroy();
+    }
+    this.partialBatchCache.clear();
+    this.partialBatchCacheKeys.clear();
+    this.geometryReleased = true;
+    this.ephemeralStreamingMode = false;
   }
 
   /**
@@ -1315,6 +1432,7 @@ export class Scene {
     this.partialBatchCacheKeys.clear();
     this.meshQueue = [];
     this.geometryReleased = false;
+    this.ephemeralStreamingMode = false;
   }
 
   /**

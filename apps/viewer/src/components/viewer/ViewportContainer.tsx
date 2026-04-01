@@ -2,14 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useMemo, useRef, useState, useCallback } from 'react';
+import { useMemo, useRef, useState, useCallback, useEffect, useSyncExternalStore } from 'react';
 import { Viewport } from './Viewport';
 import { ViewportOverlays } from './ViewportOverlays';
 import { ToolOverlays } from './ToolOverlays';
 import { Section2DPanel } from './Section2DPanel';
 import { BasketPresentationDock } from './BasketPresentationDock';
 import { BCFOverlay } from './bcf/BCFOverlay';
-import { useViewerStore } from '@/store';
+import { getViewerStoreApi, useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { collectIfcBuildingStoreyElementsWithIfcSpace } from '@/store/basketVisibleSet';
 import { useIfc } from '@/hooks/useIfc';
@@ -28,19 +28,34 @@ const DEFAULT_COORDINATE_INFO: CoordinateInfo = {
 };
 
 export function ViewportContainer() {
-  const { geometryResult, ifcDataStore, loadFile, loading, models, clearAllModels, loadFilesSequentially } = useIfc();
+  const { loadFile, loading, clearAllModels, loadFilesSequentially } = useIfc();
+  const releaseGeometryMemory = useViewerStore((s) => s.releaseGeometryMemory);
   const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
   const typeVisibility = useViewerStore((s) => s.typeVisibility);
   const isolatedEntities = useViewerStore((s) => s.isolatedEntities);
   const classFilter = useViewerStore((s) => s.classFilter);
-  // Multi-model support: get all loaded models from store (for merged geometry)
-  const storeModels = useViewerStore((s) => s.models);
   const resetViewerState = useViewerStore((s) => s.resetViewerState);
   const bcfOverlayVisible = useViewerStore((s) => s.bcfOverlayVisible);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [showTroubleshooting, setShowTroubleshooting] = useState(false);
   const webgpu = useWebGPU();
+
+  const viewerStoreApi = getViewerStoreApi();
+  const viewportStoreState = useSyncExternalStore(
+    viewerStoreApi.subscribe,
+    viewerStoreApi.getState,
+    viewerStoreApi.getState,
+  );
+
+  const {
+    geometryResult,
+    ifcDataStore,
+    models,
+    boundedGeometryMode,
+    geometryUpdateTick,
+  } = viewportStoreState;
+  const storeModels = models;
 
   // Check if we have models loaded (for determining add vs replace behavior)
   const hasModelsLoaded = models.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
@@ -55,39 +70,87 @@ export function ViewportContainer() {
     return map;
   }, [storeModels]);
 
+  const mergedCacheRef = useRef<MeshData[]>([]);
+  const mergedLengthsRef = useRef<Map<string, number>>(new Map());
+  const mergedVisibilityRef = useRef<Map<string, boolean>>(new Map());
+
   // Multi-model: merge geometries from all visible models
   const mergedGeometryResult = useMemo(() => {
-    // If we have federated models, merge their visible geometries
-    if (storeModels.size > 0) {
-      const allMeshes: MeshData[] = [];
+    if (storeModels.size === 1) {
+      const firstModel = storeModels.values().next().value;
+      if (!firstModel?.visible) {
+        return {
+          meshes: [],
+          totalVertices: 0,
+          totalTriangles: 0,
+          coordinateInfo: DEFAULT_COORDINATE_INFO,
+        } satisfies GeometryResult;
+      }
+      return firstModel.geometryResult ?? geometryResult;
+    }
+
+    if (storeModels.size > 1) {
       let totalVertices = 0;
       let totalTriangles = 0;
       let mergedCoordinateInfo: CoordinateInfo | undefined;
+      let shouldRebuild = false;
+
+      if (mergedLengthsRef.current.size !== storeModels.size) {
+        shouldRebuild = true;
+      }
 
       for (const [modelId, model] of storeModels) {
-        // Skip hidden models - this is how model visibility works
-        if (!model.visible) continue;
-
         const modelGeometry = model.geometryResult;
-        const modelIndex = modelIdToIndex.get(modelId) ?? 0;
-        if (modelGeometry?.meshes) {
-          // Tag each mesh with its modelIndex for selection/highlighting
-          for (const mesh of modelGeometry.meshes) {
-            allMeshes.push({ ...mesh, modelIndex });
-          }
-          totalVertices += modelGeometry.totalVertices || 0;
-          totalTriangles += modelGeometry.totalTriangles || 0;
+        const meshCount = model.visible ? (modelGeometry?.meshes.length ?? 0) : 0;
+        totalVertices += model.visible ? (modelGeometry?.totalVertices ?? 0) : 0;
+        totalTriangles += model.visible ? (modelGeometry?.totalTriangles ?? 0) : 0;
+        if (!mergedCoordinateInfo && model.visible && modelGeometry?.coordinateInfo) {
+          mergedCoordinateInfo = modelGeometry.coordinateInfo;
+        }
 
-          // Use first model's coordinate info as base (could be improved to compute union)
-          if (!mergedCoordinateInfo && modelGeometry.coordinateInfo) {
-            mergedCoordinateInfo = modelGeometry.coordinateInfo;
-          }
+        if (
+          mergedVisibilityRef.current.get(modelId) !== model.visible ||
+          (mergedLengthsRef.current.get(modelId) ?? 0) > meshCount
+        ) {
+          shouldRebuild = true;
         }
       }
 
-      // Return merged result (may be empty if all models hidden)
+      if (shouldRebuild) {
+        const rebuilt: MeshData[] = [];
+        mergedLengthsRef.current = new Map();
+        mergedVisibilityRef.current = new Map();
+        for (const [modelId, model] of storeModels) {
+          const modelGeometry = model.geometryResult;
+          mergedVisibilityRef.current.set(modelId, model.visible);
+          const modelIndex = modelIdToIndex.get(modelId) ?? 0;
+          if (!model.visible || !modelGeometry?.meshes) {
+            mergedLengthsRef.current.set(modelId, 0);
+            continue;
+          }
+          for (const mesh of modelGeometry.meshes) {
+            rebuilt.push({ ...mesh, modelIndex });
+          }
+          mergedLengthsRef.current.set(modelId, modelGeometry.meshes.length);
+        }
+        mergedCacheRef.current = rebuilt;
+      } else {
+        for (const [modelId, model] of storeModels) {
+          const modelGeometry = model.geometryResult;
+          const modelIndex = modelIdToIndex.get(modelId) ?? 0;
+          const previousLength = mergedLengthsRef.current.get(modelId) ?? 0;
+          const nextMeshes = model.visible ? (modelGeometry?.meshes ?? []) : [];
+          for (let i = previousLength; i < nextMeshes.length; i++) {
+            const mesh = nextMeshes[i];
+            mergedCacheRef.current.push({ ...mesh, modelIndex });
+          }
+          mergedLengthsRef.current.set(modelId, nextMeshes.length);
+          mergedVisibilityRef.current.set(modelId, model.visible);
+        }
+      }
+
       return {
-        meshes: allMeshes,
+        meshes: mergedCacheRef.current,
         totalVertices,
         totalTriangles,
         coordinateInfo: mergedCoordinateInfo ?? DEFAULT_COORDINATE_INFO,
@@ -186,6 +249,7 @@ export function ViewportContainer() {
   // A version counter triggers downstream re-renders via the Viewport prop.
   const filteredCacheRef = useRef<MeshData[]>([]);
   const filteredSourceLenRef = useRef(0);
+  const filteredSourceRef = useRef<MeshData[] | null>(null);
   const filteredTypeVisRef = useRef(typeVisibility);
   const filteredVersionRef = useRef(0);
 
@@ -193,6 +257,7 @@ export function ViewportContainer() {
     if (!mergedGeometryResult?.meshes) {
       filteredCacheRef.current = [];
       filteredSourceLenRef.current = 0;
+      filteredSourceRef.current = null;
       filteredVersionRef.current = 0;
       return null;
     }
@@ -206,9 +271,11 @@ export function ViewportContainer() {
       prevVis.spaces !== typeVisibility.spaces ||
       prevVis.openings !== typeVisibility.openings ||
       prevVis.site !== typeVisibility.site;
-    if (typeVisChanged || allMeshes.length < filteredSourceLenRef.current) {
+    const sourceChanged = filteredSourceRef.current !== allMeshes;
+    if (typeVisChanged || sourceChanged || allMeshes.length < filteredSourceLenRef.current) {
       cache.length = 0;
       filteredSourceLenRef.current = 0;
+      filteredSourceRef.current = allMeshes;
       filteredTypeVisRef.current = typeVisibility;
     }
 
@@ -240,7 +307,7 @@ export function ViewportContainer() {
 
     // Only bump version when cache content actually changed — avoids
     // unnecessary downstream re-renders when memo runs with same data.
-    if (cache.length !== prevCacheLen || typeVisChanged) {
+    if (cache.length !== prevCacheLen || typeVisChanged || sourceChanged) {
       filteredVersionRef.current++;
     }
 
@@ -252,6 +319,42 @@ export function ViewportContainer() {
   // Version counter that changes every batch — triggers useGeometryStreaming
   // without requiring a new geometry array reference.
   const geometryVersion = filteredVersionRef.current;
+
+  const viewportTraceRef = useRef<{
+    legacyMeshCount: number;
+    storeModelCount: number;
+    mergedMeshCount: number;
+    filteredMeshCount: number;
+    geometryVersion: number;
+    geometryUpdateTick: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const snapshot = {
+      legacyMeshCount: geometryResult?.meshes?.length ?? 0,
+      storeModelCount: storeModels.size,
+      mergedMeshCount: mergedGeometryResult?.meshes?.length ?? 0,
+      filteredMeshCount: filteredGeometry?.length ?? 0,
+      geometryVersion,
+      geometryUpdateTick,
+    };
+    const previous = viewportTraceRef.current;
+    if (
+      !previous ||
+      previous.legacyMeshCount !== snapshot.legacyMeshCount ||
+      previous.storeModelCount !== snapshot.storeModelCount ||
+      previous.mergedMeshCount !== snapshot.mergedMeshCount ||
+      previous.filteredMeshCount !== snapshot.filteredMeshCount ||
+      previous.geometryVersion !== snapshot.geometryVersion
+      || previous.geometryUpdateTick !== snapshot.geometryUpdateTick
+    ) {
+      viewportTraceRef.current = snapshot;
+      void logToDesktopTerminal(
+        'info',
+        `[ViewportContainer] legacyMeshes=${snapshot.legacyMeshCount} models=${snapshot.storeModelCount} mergedMeshes=${snapshot.mergedMeshCount} filteredMeshes=${snapshot.filteredMeshCount} geometryVersion=${snapshot.geometryVersion} geometryTick=${snapshot.geometryUpdateTick}`
+      );
+    }
+  }, [storeModels, mergedGeometryResult, filteredGeometry, geometryVersion, geometryUpdateTick]);
 
   // Compute combined isolation set (storeys + manual isolation)
   // This is passed to the renderer for batch-level visibility filtering
@@ -630,12 +733,14 @@ export function ViewportContainer() {
         coordinateInfo={mergedGeometryResult?.coordinateInfo}
         computedIsolatedIds={computedIsolatedIds}
         modelIdToIndex={modelIdToIndex}
+        releaseGeometryAfterStream={false}
+        onGeometryReleased={releaseGeometryMemory}
       />
       {bcfOverlayVisible && <BCFOverlay />}
       <ViewportOverlays />
       <ToolOverlays />
       <BasketPresentationDock />
-      <Section2DPanel 
+      <Section2DPanel
         mergedGeometry={mergedGeometryResult}
         computedIsolatedIds={computedIsolatedIds}
         modelIdToIndex={modelIdToIndex}

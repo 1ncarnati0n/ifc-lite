@@ -117,6 +117,28 @@ export type StreamingInstancedGeometryEvent =
   | { type: 'batch'; geometries: import('@ifc-lite/wasm').InstancedGeometry[]; totalSoFar: number; coordinateInfo?: import('./types.js').CoordinateInfo }
   | { type: 'complete'; totalGeometries: number; totalInstances: number; coordinateInfo: import('./types.js').CoordinateInfo };
 
+type QueuedNativeStreamingEvent =
+  | { type: 'batch'; meshes: MeshData[]; nativeTelemetry?: import('./platform-bridge.js').NativeBatchTelemetry }
+  | { type: 'colorUpdate'; updates: Map<number, [number, number, number, number]> };
+
+const MAX_NATIVE_STREAM_QUEUE_EVENTS = 8;
+const MAX_NATIVE_STREAM_QUEUE_MESHES = 32768;
+const MAX_NATIVE_STREAM_EVENTS_PER_TURN = 4;
+const MAX_NATIVE_STREAM_MESHES_PER_TURN = 8192;
+const MAX_NATIVE_STREAM_DRAIN_MS = 10;
+
+function yieldToEventLoop(): Promise<void> {
+  const maybeScheduler = (globalThis as typeof globalThis & {
+    scheduler?: { yield?: () => Promise<void> };
+  }).scheduler;
+  if (typeof maybeScheduler?.yield === 'function') {
+    return maybeScheduler.yield();
+  }
+  return new Promise<void>((resolve) => {
+    globalThis.setTimeout(resolve, 0);
+  });
+}
+
 export class GeometryProcessor {
   private bridge: IfcLiteBridge | null = null;
   private platformBridge: IPlatformBridge | null = null;
@@ -420,7 +442,8 @@ export class GeometryProcessor {
    */
   async *processStreamingPath(
     path: string,
-    estimatedBytes: number = 0
+    estimatedBytes: number = 0,
+    cacheKey?: string,
   ): AsyncGenerator<StreamingGeometryEvent> {
     if (!this.isNative) {
       throw new Error('File-path geometry streaming is only available in native desktop builds');
@@ -432,85 +455,29 @@ export class GeometryProcessor {
       throw new Error('Native platform bridge does not support file-path streaming');
     }
 
-    this.coordinateHandler.reset();
+    yield* this.streamNativeGeometry(
+      (options) => this.platformBridge!.processGeometryStreamingPath!(path, options, cacheKey),
+      estimatedBytes > 0 ? estimatedBytes / 1000 : 0
+    );
+  }
 
-    yield { type: 'start', totalEstimate: estimatedBytes > 0 ? estimatedBytes / 1000 : 0 };
-    await new Promise(resolve => setTimeout(resolve, 0));
-    yield { type: 'model-open', modelID: 0 };
-
-    const queuedEvents: Array<
-      | { type: 'batch'; meshes: MeshData[]; nativeTelemetry?: import('./platform-bridge.js').NativeBatchTelemetry }
-      | { type: 'colorUpdate'; updates: Map<number, [number, number, number, number]> }
-    > = [];
-    let resolvePending: (() => void) | null = null;
-    let completed = false;
-    let streamError: Error | null = null;
-    let completedTotalMeshes: number | undefined;
-    let totalMeshes = 0;
-
-    const wake = () => {
-      if (resolvePending) {
-        resolvePending();
-        resolvePending = null;
-      }
-    };
-
-    const streamingPromise = this.platformBridge.processGeometryStreamingPath(path, {
-      onBatch: (batch) => {
-        queuedEvents.push({ type: 'batch', meshes: batch.meshes, nativeTelemetry: batch.nativeTelemetry });
-        wake();
-      },
-      onColorUpdate: (updates) => {
-        queuedEvents.push({ type: 'colorUpdate', updates: new Map(updates) });
-        wake();
-      },
-      onComplete: (stats) => {
-        this.lastNativeStats = stats;
-        completedTotalMeshes = stats.totalMeshes;
-        completed = true;
-        wake();
-      },
-      onError: (error) => {
-        streamError = error;
-        completed = true;
-        wake();
-      },
-    });
-
-    while (!completed || queuedEvents.length > 0) {
-      while (queuedEvents.length > 0) {
-        const event = queuedEvents.shift()!;
-        if (event.type === 'colorUpdate') {
-          yield { type: 'colorUpdate', updates: event.updates };
-          continue;
-        }
-        this.coordinateHandler.processMeshesIncremental(event.meshes);
-        totalMeshes += event.meshes.length;
-        const coordinateInfo = this.coordinateHandler.getCurrentCoordinateInfo();
-        yield {
-          type: 'batch',
-          meshes: event.meshes,
-          totalSoFar: totalMeshes,
-          coordinateInfo: coordinateInfo || undefined,
-          nativeTelemetry: event.nativeTelemetry,
-        };
-      }
-
-      if (streamError) {
-        throw streamError;
-      }
-
-      if (!completed) {
-        await new Promise<void>((resolve) => {
-          resolvePending = resolve;
-        });
-      }
+  async *processStreamingCache(
+    cacheKey: string
+  ): AsyncGenerator<StreamingGeometryEvent> {
+    if (!this.isNative) {
+      throw new Error('Native cached geometry streaming is only available in native desktop builds');
+    }
+    if (!this.platformBridge) {
+      await this.init();
+    }
+    if (!this.platformBridge?.processGeometryStreamingCache) {
+      throw new Error('Native platform bridge does not support cached geometry streaming');
     }
 
-    await streamingPromise;
-
-    const coordinateInfo = this.coordinateHandler.getFinalCoordinateInfo();
-    yield { type: 'complete', totalMeshes: completedTotalMeshes ?? totalMeshes, coordinateInfo };
+    yield* this.streamNativeGeometry(
+      (options) => this.platformBridge!.processGeometryStreamingCache!(cacheKey, options),
+      0
+    );
   }
 
   /**
@@ -918,6 +885,159 @@ export class GeometryProcessor {
 
   getLastNativeStats(): PlatformGeometryStats | null {
     return this.lastNativeStats;
+  }
+
+  private enqueueNativeStreamingEvent(
+    queuedEvents: QueuedNativeStreamingEvent[],
+    event: QueuedNativeStreamingEvent,
+    queueState: { queuedMeshes: number; coalescedBatchCount: number }
+  ): void {
+    if (event.type === 'colorUpdate') {
+      const lastEvent = queuedEvents[queuedEvents.length - 1];
+      if (lastEvent?.type === 'colorUpdate') {
+        for (const [expressId, color] of event.updates) {
+          lastEvent.updates.set(expressId, color);
+        }
+        return;
+      }
+      queuedEvents.push(event);
+      return;
+    }
+
+    const lastEvent = queuedEvents[queuedEvents.length - 1];
+    const shouldCoalesce =
+      lastEvent?.type === 'batch' &&
+      (queuedEvents.length >= MAX_NATIVE_STREAM_QUEUE_EVENTS || queueState.queuedMeshes >= MAX_NATIVE_STREAM_QUEUE_MESHES);
+
+    if (shouldCoalesce) {
+      for (let i = 0; i < event.meshes.length; i++) {
+        lastEvent.meshes.push(event.meshes[i]);
+      }
+      lastEvent.nativeTelemetry = event.nativeTelemetry;
+      queueState.coalescedBatchCount += 1;
+    } else {
+      queuedEvents.push(event);
+    }
+
+    queueState.queuedMeshes += event.meshes.length;
+  }
+
+  private async *streamNativeGeometry(
+    startStream: (options: {
+      onBatch: (batch: import('./platform-bridge.js').GeometryBatch) => void;
+      onColorUpdate: (updates: Map<number, [number, number, number, number]>) => void;
+      onComplete: (stats: PlatformGeometryStats) => void;
+      onError: (error: Error) => void;
+    }) => Promise<PlatformGeometryStats>,
+    totalEstimate: number
+  ): AsyncGenerator<StreamingGeometryEvent> {
+    this.coordinateHandler.reset();
+
+    yield { type: 'start', totalEstimate };
+    await yieldToEventLoop();
+    yield { type: 'model-open', modelID: 0 };
+
+    const queuedEvents: QueuedNativeStreamingEvent[] = [];
+    const queueState = { queuedMeshes: 0, coalescedBatchCount: 0 };
+    let resolvePending: (() => void) | null = null;
+    let completed = false;
+    let streamError: Error | null = null;
+    let completedTotalMeshes: number | undefined;
+    let totalMeshes = 0;
+
+    const wake = () => {
+      if (resolvePending) {
+        resolvePending();
+        resolvePending = null;
+      }
+    };
+
+    const streamingPromise = startStream({
+      onBatch: (batch) => {
+        this.enqueueNativeStreamingEvent(
+          queuedEvents,
+          { type: 'batch', meshes: batch.meshes, nativeTelemetry: batch.nativeTelemetry },
+          queueState
+        );
+        wake();
+      },
+      onColorUpdate: (updates) => {
+        this.enqueueNativeStreamingEvent(queuedEvents, { type: 'colorUpdate', updates: new Map(updates) }, queueState);
+        wake();
+      },
+      onComplete: (stats) => {
+        this.lastNativeStats = stats;
+        completedTotalMeshes = stats.totalMeshes;
+        completed = true;
+        wake();
+      },
+      onError: (error) => {
+        streamError = error;
+        completed = true;
+        wake();
+      },
+    });
+
+    while (!completed || queuedEvents.length > 0) {
+      let drainedEventCount = 0;
+      let drainedMeshCount = 0;
+      let drainStartedAt = performance.now();
+      while (queuedEvents.length > 0) {
+        const event = queuedEvents.shift()!;
+        if (event.type === 'colorUpdate') {
+          yield { type: 'colorUpdate', updates: event.updates };
+          continue;
+        }
+
+        queueState.queuedMeshes = Math.max(0, queueState.queuedMeshes - event.meshes.length);
+        this.coordinateHandler.processMeshesIncremental(event.meshes);
+        totalMeshes += event.meshes.length;
+        const coordinateInfo = this.coordinateHandler.getCurrentCoordinateInfo();
+        yield {
+          type: 'batch',
+          meshes: event.meshes,
+          totalSoFar: totalMeshes,
+          coordinateInfo: coordinateInfo || undefined,
+          nativeTelemetry: event.nativeTelemetry,
+        };
+        drainedEventCount += 1;
+        drainedMeshCount += event.meshes.length;
+
+        if (queuedEvents.length > 0) {
+          const shouldYield =
+            drainedEventCount >= MAX_NATIVE_STREAM_EVENTS_PER_TURN ||
+            drainedMeshCount >= MAX_NATIVE_STREAM_MESHES_PER_TURN ||
+            performance.now() - drainStartedAt >= MAX_NATIVE_STREAM_DRAIN_MS;
+          if (shouldYield) {
+            await yieldToEventLoop();
+            drainedEventCount = 0;
+            drainedMeshCount = 0;
+            drainStartedAt = performance.now();
+          }
+        }
+      }
+
+      if (streamError) {
+        throw streamError;
+      }
+
+      if (!completed) {
+        await new Promise<void>((resolve) => {
+          resolvePending = resolve;
+        });
+      }
+    }
+
+    await streamingPromise;
+
+    if (queueState.coalescedBatchCount > 0) {
+      console.info(
+        `[GeometryProcessor] Coalesced ${queueState.coalescedBatchCount} native batches while JS drained the queue`
+      );
+    }
+
+    const coordinateInfo = this.coordinateHandler.getFinalCoordinateInfo();
+    yield { type: 'complete', totalMeshes: completedTotalMeshes ?? totalMeshes, coordinateInfo };
   }
 
   /**

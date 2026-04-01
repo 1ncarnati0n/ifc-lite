@@ -68,7 +68,7 @@ import { useFloorplanView } from '@/hooks/useFloorplanView';
 import { recordRecentFiles, cacheFileBlobs } from '@/lib/recent-files';
 import { ThemeSwitch } from './ThemeSwitch';
 import { toast } from '@/components/ui/toast';
-import { getStartupHarnessRequest, tryClaimStartupHarnessRequest } from '@/services/desktop-harness';
+import { getStartupHarnessRequest, setActiveHarnessRequest, tryClaimStartupHarnessRequest } from '@/services/desktop-harness';
 import { logToDesktopTerminal } from '@/services/desktop-logger';
 import { openIfcFileDialog } from '@/services/file-dialog';
 
@@ -151,7 +151,21 @@ interface MainToolbarProps {
 export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainToolbarProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addModelInputRef = useRef<HTMLInputElement>(null);
-  const { loadFile, loading, progress, geometryResult, ifcDataStore, models, clearAllModels, loadFilesSequentially, loadFederatedIfcx, addIfcxOverlays, addModel } = useIfc();
+  const {
+    loadFile,
+    loading,
+    progress,
+    geometryProgress,
+    metadataProgress,
+    geometryResult,
+    ifcDataStore,
+    models,
+    clearAllModels,
+    loadFilesSequentially,
+    loadFederatedIfcx,
+    addIfcxOverlays,
+    addModel,
+  } = useIfc();
 
   // Listen for programmatic file-load requests (from command palette recent files)
   useEffect(() => {
@@ -167,6 +181,28 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
 
   useEffect(() => {
     let cancelled = false;
+    const sleep = (ms: number) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+
+    const waitForViewerToSettle = async (label: string) => {
+      const timeoutMs = 120_000;
+      const pollMs = 100;
+      const start = performance.now();
+      while (!cancelled) {
+        const state = useViewerStore.getState();
+        const meshCount = state.geometryResult?.meshes.length ?? 0;
+        if (!state.loading && meshCount > 0) {
+          void logToDesktopTerminal(
+            'info',
+            `[DesktopHarness] ${label} settled: loading=${state.loading} meshes=${meshCount} progress=${state.progress?.phase ?? 'none'}`
+          );
+          return;
+        }
+        if (performance.now() - start >= timeoutMs) {
+          throw new Error(`[DesktopHarness] Timed out waiting for ${label} to settle`);
+        }
+        await sleep(pollMs);
+      }
+    };
 
     void (async () => {
       void logToDesktopTerminal('info', '[DesktopHarness] MainToolbar startup harness effect running');
@@ -184,8 +220,30 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
       }
       void logToDesktopTerminal('info', `[DesktopHarness] Claimed startup harness request for ${request.file.path}`);
       console.log(`[DesktopHarness] Auto-loading startup file: ${request.file.path}`);
-      void logToDesktopTerminal('info', `[DesktopHarness] Calling loadFile for ${request.file.path}`);
+      if (!request.replaceFile) {
+        void logToDesktopTerminal('info', `[DesktopHarness] Calling loadFile for ${request.file.path}`);
+        await loadFile(request.file);
+        return;
+      }
+
+      void logToDesktopTerminal(
+        'info',
+        `[DesktopHarness] Running replacement sequence first=${request.file.path} second=${request.replaceFile.path}`
+      );
+      setActiveHarnessRequest(null);
       await loadFile(request.file);
+      await waitForViewerToSettle(`first load ${request.file.name}`);
+      if (cancelled) {
+        return;
+      }
+
+      setActiveHarnessRequest({
+        ...request,
+        file: request.replaceFile,
+        replaceFile: undefined,
+      });
+      void logToDesktopTerminal('info', `[DesktopHarness] Calling replacement loadFile for ${request.replaceFile.path}`);
+      await loadFile(request.replaceFile);
     })();
 
     return () => {
@@ -589,7 +647,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               if (file) {
                 void logToDesktopTerminal('info', `[MainToolbar] Native dialog selected ${file.path}`);
                 recordRecentFiles([{ name: file.name, size: file.size }]);
-                loadFile(file);
+                void loadFile(file);
                 return;
               }
 
@@ -990,15 +1048,20 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
       <div className="flex-1" />
 
       {/* Loading Progress */}
-      {loading && progress && (
+      {loading && (geometryProgress || metadataProgress || progress) && (
         <div className="flex items-center gap-2 mr-4">
-          <span className="text-xs text-muted-foreground">{progress.phase}</span>
-          {progress.indeterminate ? (
+          <span className="text-xs text-muted-foreground">
+            {(geometryProgress ?? metadataProgress ?? progress)?.phase}
+            {geometryProgress && metadataProgress ? ` | ${metadataProgress.phase}` : ''}
+          </span>
+          {(geometryProgress ?? metadataProgress ?? progress)?.indeterminate ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
           ) : (
             <>
-              <Progress value={progress.percent} className="w-32 h-2" />
-              <span className="text-xs text-muted-foreground">{Math.round(progress.percent)}%</span>
+              <Progress value={(geometryProgress ?? metadataProgress ?? progress)?.percent ?? 0} className="w-32 h-2" />
+              <span className="text-xs text-muted-foreground">
+                {Math.round((geometryProgress ?? metadataProgress ?? progress)?.percent ?? 0)}%
+              </span>
             </>
           )}
         </div>
