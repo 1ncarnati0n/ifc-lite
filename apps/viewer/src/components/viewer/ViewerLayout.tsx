@@ -47,6 +47,18 @@ export function ViewerLayout() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
+  useEffect(() => {
+    const openCommandPalette = () => setCommandPaletteOpen(true);
+    const showShortcuts = () => shortcutsDialog.toggle();
+
+    window.addEventListener('ifc-lite:open-command-palette', openCommandPalette);
+    window.addEventListener('ifc-lite:show-shortcuts', showShortcuts);
+    return () => {
+      window.removeEventListener('ifc-lite:open-command-palette', openCommandPalette);
+      window.removeEventListener('ifc-lite:show-shortcuts', showShortcuts);
+    };
+  }, [shortcutsDialog]);
+
   // Initialize theme on mount
   const theme = useViewerStore((s) => s.theme);
   const isMobile = useViewerStore((s) => s.isMobile);
