@@ -110,7 +110,13 @@ export const mainShaderSource = `
           // compute flat normals from screen-space derivatives of world position.
           var N = input.normal;
           if (dot(N, N) < 0.0001) {
-            N = normalize(cross(dpdx(input.worldPos), dpdy(input.worldPos)));
+            let faceN = cross(dpdx(input.worldPos), dpdy(input.worldPos));
+            let faceLen2 = dot(faceN, faceN);
+            if (faceLen2 > 1e-10) {
+              N = faceN * inverseSqrt(faceLen2);
+            } else {
+              N = vec3<f32>(0.0, 1.0, 0.0);
+            }
           } else {
             N = normalize(N);
           }
