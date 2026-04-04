@@ -494,6 +494,24 @@ fn is_quick_spatial_type(type_upper: &str) -> bool {
     )
 }
 
+/// Case-insensitive variant that avoids to_ascii_uppercase() allocation.
+#[inline]
+fn is_quick_spatial_type_ci(type_name: &str) -> bool {
+    type_name.eq_ignore_ascii_case("IFCPROJECT")
+        || type_name.eq_ignore_ascii_case("IFCSITE")
+        || type_name.eq_ignore_ascii_case("IFCBUILDING")
+        || type_name.eq_ignore_ascii_case("IFCBUILDINGSTOREY")
+        || type_name.eq_ignore_ascii_case("IFCSPACE")
+        || type_name.eq_ignore_ascii_case("IFCFACILITY")
+        || type_name.eq_ignore_ascii_case("IFCFACILITYPART")
+        || type_name.eq_ignore_ascii_case("IFCBRIDGE")
+        || type_name.eq_ignore_ascii_case("IFCBRIDGEPART")
+        || type_name.eq_ignore_ascii_case("IFCROAD")
+        || type_name.eq_ignore_ascii_case("IFCROADPART")
+        || type_name.eq_ignore_ascii_case("IFCRAILWAY")
+        || type_name.eq_ignore_ascii_case("IFCRAILWAYPART")
+}
+
 fn parse_step_arguments<'a>(entity_text: &'a str) -> Vec<&'a str> {
     let Some(open_idx) = entity_text.find('(') else {
         return Vec::new();
@@ -797,14 +815,15 @@ pub fn process_geometry_streaming_filtered_with_options(
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
         total_entities += 1;
         if let Some(spatial_nodes) = quick_spatial_nodes.as_mut() {
-            let type_upper = type_name.to_ascii_uppercase();
-            if is_quick_spatial_type(&type_upper) {
+            // Case-insensitive check without allocating a new uppercase string.
+            if is_quick_spatial_type_ci(type_name) {
                 let args = parse_step_arguments(&content[start..end]);
+                let fallback = format!("{type_name} #{id}");
                 spatial_nodes.entry(id).or_insert(QuickSpatialNodeEntry {
                     express_id: id,
                     type_name: type_name.to_string(),
-                    name: extract_name_from_args(&args, &format!("{type_name} #{id}")),
-                    elevation: if type_name == "IfcBuildingStorey" {
+                    name: extract_name_from_args(&args, &fallback),
+                    elevation: if type_name.eq_ignore_ascii_case("IfcBuildingStorey") {
                         extract_storey_elevation_from_args(&args)
                     } else {
                         None
@@ -813,7 +832,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     elements: Vec::new(),
                     parent: None,
                 });
-            } else if type_upper == "IFCRELAGGREGATES" {
+            } else if type_name.eq_ignore_ascii_case("IFCRELAGGREGATES") {
                 let args = parse_step_arguments(&content[start..end]);
                 if let Some(parent_id) = args.get(4).and_then(|token| parse_step_ref(token)) {
                     quick_aggregate_links.push((
@@ -823,8 +842,8 @@ pub fn process_geometry_streaming_filtered_with_options(
                             .unwrap_or_default(),
                     ));
                 }
-            } else if type_upper == "IFCRELCONTAINEDINSPATIALSTRUCTURE"
-                || type_upper == "IFCRELREFERENCEDINSPATIALSTRUCTURE"
+            } else if type_name.eq_ignore_ascii_case("IFCRELCONTAINEDINSPATIALSTRUCTURE")
+                || type_name.eq_ignore_ascii_case("IFCRELREFERENCEDINSPATIALSTRUCTURE")
             {
                 let args = parse_step_arguments(&content[start..end]);
                 if let Some(parent_id) = args.get(5).and_then(|token| parse_step_ref(token)) {
