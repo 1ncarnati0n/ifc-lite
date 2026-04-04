@@ -106,19 +106,16 @@ export const mainShaderSource = `
             }
           }
 
-          // When vertex normals are zero (desktop no-normals fast path),
-          // compute flat normals from screen-space derivatives of world position.
+          // Compute normal — with fallback for zero normals
           var N = input.normal;
-          if (dot(N, N) < 0.0001) {
+          let nLen2 = dot(N, N);
+          if (nLen2 < 0.0001) {
+            // Fallback: compute flat normal from screen-space derivatives
             let faceN = cross(dpdx(input.worldPos), dpdy(input.worldPos));
-            let faceLen2 = dot(faceN, faceN);
-            if (faceLen2 > 1e-10) {
-              N = faceN * inverseSqrt(faceLen2);
-            } else {
-              N = vec3<f32>(0.0, 1.0, 0.0);
-            }
+            let fLen2 = dot(faceN, faceN);
+            N = select(vec3<f32>(0.0, 1.0, 0.0), faceN * inverseSqrt(fLen2), fLen2 > 1e-10);
           } else {
-            N = normalize(N);
+            N = N * inverseSqrt(nLen2);
           }
 
           // Enhanced lighting with multiple sources

@@ -1305,24 +1305,9 @@ fn add_triangle_to_mesh(mesh: &mut Mesh, triangle: &Triangle) {
     mesh.add_triangle(base_idx, base_idx + 1, base_idx + 2);
 }
 
-/// Calculate smooth normals for a mesh.
-/// On desktop (non-WASM), this is a no-op: the GPU shader computes flat
-/// normals from screen-space derivatives (`dpdx`/`dpdy`), saving ~0.5s
-/// on large models.
-#[cfg(target_arch = "wasm32")]
+/// Calculate smooth normals for a mesh
 #[inline]
 pub fn calculate_normals(mesh: &mut Mesh) {
-    calculate_normals_impl(mesh);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[inline]
-pub fn calculate_normals(_mesh: &mut Mesh) {
-    // No-op on desktop — GPU shader computes flat normals from derivatives
-}
-
-#[inline]
-fn calculate_normals_impl(mesh: &mut Mesh) {
     let vertex_count = mesh.vertex_count();
     if vertex_count == 0 {
         return;
