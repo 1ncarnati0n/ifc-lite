@@ -767,17 +767,10 @@ pub fn process_geometry_streaming_filtered_with_options(
         "Starting IFC geometry processing"
     );
 
-    // Build entity index incrementally during the scanner loop instead of
-    // scanning the 1GB file twice.  build_entity_index uses memchr for ';'
-    // which doesn't handle quoted strings — the scanner's find_entity_end
-    // is more correct AND we avoid a redundant full-file traversal.
-    let estimated_entities = content.len() / 50;
-    let mut entity_index_map: FxHashMap<u32, (usize, usize)> =
-        FxHashMap::with_capacity_and_hasher(estimated_entities, Default::default());
-    // Decoder initialized AFTER scanner loop with the completed index
-    let entity_index_placeholder = Arc::new(FxHashMap::default());
-    let mut decoder = EntityDecoder::with_arc_index(content, entity_index_placeholder.clone());
-    tracing::debug!("Starting single-pass entity scan (no separate build_entity_index)");
+    // Build entity index (fast SIMD-accelerated single pass)
+    let entity_index = Arc::new(build_entity_index(content));
+    let mut decoder = EntityDecoder::with_arc_index(content, entity_index.clone());
+    tracing::debug!("Built entity index");
 
     let mut geometry_style_index: FxHashMap<u32, GeometryStyleInfo> = FxHashMap::default();
     let mut presentation_layer_by_assigned_id: FxHashMap<u32, String> = FxHashMap::default();
@@ -821,8 +814,6 @@ pub fn process_geometry_streaming_filtered_with_options(
 
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
         total_entities += 1;
-        // Build entity index incrementally — avoids separate build_entity_index pass
-        entity_index_map.insert(id, (start, end));
         if let Some(spatial_nodes) = quick_spatial_nodes.as_mut() {
             // Case-insensitive check without allocating a new uppercase string.
             if is_quick_spatial_type_ci(type_name) {
@@ -972,12 +963,6 @@ pub fn process_geometry_streaming_filtered_with_options(
     }
 
     let entity_scan_time = entity_scan_start.elapsed();
-
-    // Finalize the entity index and re-create the decoder with the complete index.
-    // This replaces the placeholder empty index used during scanning.
-    let entity_index = Arc::new(entity_index_map);
-    decoder = EntityDecoder::with_arc_index(content, entity_index.clone());
-    tracing::debug!(entities = total_entities, "Entity scan complete (single-pass)");
 
     let lookup_start = std::time::Instant::now();
     if options.include_properties {
