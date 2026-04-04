@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust/core", "rust/geometry", "rust/processing", "rust/wasm-bindings", "apps/server", "apps/desktop/src-tauri"]
+members = ["rust/core", "rust/engine", "rust/geometry", "rust/processing", "rust/wasm-bindings", "apps/server", "apps/desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]
@@ -11,7 +11,9 @@ repository = "https://github.com/louistrue/ifc-lite"
 
 [workspace.dependencies]
 ifc-lite-core = { version = "2.1.7", path = "rust/core" }
+ifc-lite-engine = { version = "2.1.7", path = "rust/engine" }
 ifc-lite-geometry = { version = "2.1.7", path = "rust/geometry" }
+ifc-lite-processing = { version = "2.1.7", path = "rust/processing" }
 ifc-lite-wasm = { version = "2.1.7", path = "rust/wasm-bindings" }
 
 [profile.release]

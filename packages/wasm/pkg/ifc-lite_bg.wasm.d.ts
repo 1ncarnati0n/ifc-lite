@@ -107,6 +107,7 @@ export const ifcapi_processInstancedGeometryBatch: (a: number, b: number, c: num
 export const ifcapi_scanEntitiesFast: (a: number, b: number, c: number) => number;
 export const ifcapi_scanEntitiesFastBytes: (a: number, b: number, c: number) => number;
 export const ifcapi_scanGeometryEntitiesFast: (a: number, b: number, c: number) => number;
+export const ifcapi_scanRelevantEntitiesFastBytes: (a: number, b: number, c: number) => number;
 export const ifcapi_version: (a: number, b: number) => void;
 export const instancedata_color: (a: number, b: number) => void;
 export const instancedata_expressId: (a: number) => number;

@@ -544,6 +544,11 @@ export class IfcAPI {
    */
   scanGeometryEntitiesFast(content: string): any;
   /**
+   * Fast scan that only returns metadata-relevant entity refs.
+   * This drastically reduces transfer size for huge-file metadata hydration.
+   */
+  scanRelevantEntitiesFastBytes(data: Uint8Array): any;
+  /**
    * Parse IFC file (traditional - waits for completion)
    *
    * Example:
@@ -1077,6 +1082,7 @@ export interface InitOutput {
   readonly ifcapi_scanEntitiesFast: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanEntitiesFastBytes: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanGeometryEntitiesFast: (a: number, b: number, c: number) => number;
+  readonly ifcapi_scanRelevantEntitiesFastBytes: (a: number, b: number, c: number) => number;
   readonly ifcapi_version: (a: number, b: number) => void;
   readonly instancedata_color: (a: number, b: number) => void;
   readonly instancedata_expressId: (a: number) => number;
