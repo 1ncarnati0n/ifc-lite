@@ -630,6 +630,19 @@ export class ColumnarParser {
             'IFCFLOWSEGMENT', 'IFCFLOWTERMINAL', 'IFCFLOWCONTROLLER', 'IFCFLOWFITTING',
             'IFCSPACE', 'IFCOPENINGELEMENT', 'IFCSITE', 'IFCBUILDING', 'IFCBUILDINGSTOREY',
             'IFCPROJECT', 'IFCCOVERING', 'IFCANNOTATION', 'IFCGRID',
+            // Infrastructure entities needed by on-demand extraction and StepExporter.
+            // Without these, findPreferredGeometricRepresentationContextId() and
+            // findLengthUnitReference() fail because the entities are not in byId.
+            'IFCGEOMETRICREPRESENTATIONCONTEXT', 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT',
+            'IFCUNITASSIGNMENT', 'IFCSIUNIT', 'IFCCONVERSIONBASEDUNIT',
+            'IFCDERIVEDUNIT', 'IFCDERIVEDUNITELEMENT', 'IFCMEASUREWITHUNIT',
+            'IFCDIMENSIONALEXPONENTS',
+            'IFCMAPCONVERSION', 'IFCPROJECTEDCRS',
+            'IFCMATERIALLAYER', 'IFCMATERIALLAYERSET', 'IFCMATERIALLAYERSETUSAGE',
+            'IFCMATERIALCONSTITUENTSET', 'IFCMATERIALCONSTITUENT',
+            'IFCMATERIALPROFILESET', 'IFCMATERIALPROFILE', 'IFCMATERIAL',
+            'IFCCLASSIFICATION', 'IFCCLASSIFICATIONREFERENCE',
+            'IFCDOCUMENTINFORMATION', 'IFCDOCUMENTREFERENCE',
         ]);
 
         // Category constants for the lookup cache
